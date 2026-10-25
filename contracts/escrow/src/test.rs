@@ -32,6 +32,7 @@ fn setup<'a>() -> Setup<'a> {
     let id = env.register(Escrow, ());
     let escrow = EscrowClient::new(&env, &id);
     escrow.initialize(&admin);
+    escrow.allow_token(&sac.address());
     let token = TokenClient::new(&env, &sac.address());
     Setup {
         env,
@@ -877,6 +878,7 @@ fn test_sweep_surplus_and_direct_deposit() {
     // Initialize contract
     let escrow_client = EscrowClient::new(&env, &contract_id);
     escrow_client.initialize(&admin);
+    escrow_client.allow_token(&token_id);
 
     // Mint tokens to client using admin client
     token_admin_client.mint(&client, &(1000 * U));
@@ -944,6 +946,7 @@ fn liability_randomized_lifecycle() {
 
     let escrow_client = EscrowClient::new(&env, &contract_id);
     escrow_client.initialize(&admin);
+    escrow_client.allow_token(&token_id);
 
     token_admin_client.mint(&client, &(100_000 * U));
 
@@ -3376,4 +3379,213 @@ fn grant_and_revoke_role_unchanged_and_admin_only() {
         .is_err());
     s.env.mock_all_auths();
     assert!(!s.escrow.has_role(&Role::Resolver, &account));
+}
+
+// ---------------------------------------------------------------------------
+// Token allowlist
+// ---------------------------------------------------------------------------
+
+fn new_sac(s: &Setup) -> TokenClient<'static> {
+    let sac = s.env.register_stellar_asset_contract_v2(s.admin.clone());
+    StellarAssetClient::new(&s.env, &sac.address()).mint(&s.client, &(1_000 * U));
+    TokenClient::new(&s.env, &sac.address())
+}
+
+fn last_event_topic_and_token(s: &Setup) -> (Symbol, Address) {
+    let events = s.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(last.0, s.escrow.address);
+    assert_eq!(last.1.len(), 1);
+    let topic = Symbol::try_from_val(&s.env, &last.1.get(0).unwrap()).unwrap();
+    let token = Address::try_from_val(&s.env, &last.2).unwrap();
+    (topic, token)
+}
+
+#[test]
+fn create_rejects_non_allowlisted_token_until_allowed() {
+    let s = setup();
+    let other = new_sac(&s);
+    assert!(s.escrow.is_token_allowed(&s.token.address));
+    assert!(!s.escrow.is_token_allowed(&other.address));
+
+    assert_eq!(
+        s.escrow.try_create_contract(
+            &s.client,
+            &s.freelancer,
+            &other.address,
+            &vec![&s.env, 100 * U]
+        ),
+        Err(Ok(EscrowError::TokenNotAllowed))
+    );
+    assert_eq!(
+        s.escrow.try_create_contract_sequential(
+            &s.client,
+            &s.freelancer,
+            &other.address,
+            &vec![&s.env, 100 * U]
+        ),
+        Err(Ok(EscrowError::TokenNotAllowed))
+    );
+    assert_eq!(s.escrow.contract_count(), 0);
+
+    s.escrow.allow_token(&other.address);
+    assert_eq!(
+        last_event_topic_and_token(&s),
+        (symbol_short!("tok_allow"), other.address.clone())
+    );
+    assert!(s.escrow.is_token_allowed(&other.address));
+
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &other.address,
+        &vec![&s.env, 100 * U],
+    );
+    assert_eq!(s.escrow.get_contract(&id).token, other.address);
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(other.balance(&s.freelancer), 100 * U);
+}
+
+#[test]
+fn disallow_blocks_new_escrows_but_not_existing_ones() {
+    let s = setup();
+    let token = &s.token;
+
+    // Funded escrow to be released after disallow.
+    let released = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &token.address,
+        &vec![&s.env, 100 * U, 50 * U],
+    );
+    s.escrow.deposit_funds(&released, &(150 * U));
+    // Funded escrow to be cancelled after disallow.
+    let cancelled = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &token.address,
+        &vec![&s.env, 200 * U],
+    );
+    s.escrow.deposit_funds(&cancelled, &(200 * U));
+    // Funded escrow to be disputed and resolved after disallow.
+    let disputed = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&disputed, &(100 * U));
+    // Unfunded escrow to be deposited into after disallow.
+    let late = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &token.address,
+        &vec![&s.env, 40 * U],
+    );
+    assert_eq!(token.balance(&s.client), 550 * U);
+    assert_eq!(token.balance(&s.escrow.address), 450 * U);
+
+    s.escrow.disallow_token(&token.address);
+    assert_eq!(
+        last_event_topic_and_token(&s),
+        (symbol_short!("tok_deny"), token.address.clone())
+    );
+    assert!(!s.escrow.is_token_allowed(&token.address));
+    assert_eq!(
+        s.escrow.try_create_contract(
+            &s.client,
+            &s.freelancer,
+            &token.address,
+            &vec![&s.env, 100 * U]
+        ),
+        Err(Ok(EscrowError::TokenNotAllowed))
+    );
+
+    s.escrow.release_milestone(&released, &0);
+    s.escrow.release_milestone(&released, &1);
+    assert_eq!(token.balance(&s.freelancer), 150 * U);
+    assert_eq!(
+        s.escrow.get_contract(&released).status,
+        ContractStatus::Completed
+    );
+
+    s.escrow.cancel_contract(&cancelled);
+    assert_eq!(token.balance(&s.client), 750 * U);
+    assert_eq!(
+        s.escrow.get_contract(&cancelled).status,
+        ContractStatus::Cancelled
+    );
+
+    s.escrow.open_dispute(&disputed, &s.freelancer);
+    s.escrow.resolve_dispute(&s.admin, &disputed, &5_000);
+    assert_eq!(token.balance(&s.freelancer), 200 * U);
+    assert_eq!(token.balance(&s.client), 800 * U);
+
+    s.escrow.deposit_funds(&late, &(40 * U));
+    s.escrow.cancel_contract(&late);
+    assert_eq!(token.balance(&s.client), 800 * U);
+
+    assert_eq!(token.balance(&s.escrow.address), 0);
+    assert_eq!(s.escrow.get_liability(&token.address), 0);
+
+    // Re-allowing restores creation.
+    s.escrow.allow_token(&token.address);
+    s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &token.address,
+        &vec![&s.env, 100 * U],
+    );
+}
+
+#[test]
+fn non_admin_cannot_allow_or_disallow_token() {
+    let s = setup();
+    let other = new_sac(&s);
+    let attacker = Address::generate(&s.env);
+
+    let allow = s
+        .escrow
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "allow_token",
+                args: (&other.address,).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_allow_token(&other.address);
+    assert!(allow.is_err());
+    assert!(!s.escrow.is_token_allowed(&other.address));
+
+    let deny = s
+        .escrow
+        .mock_auths(&[MockAuth {
+            address: &s.client,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "disallow_token",
+                args: (&s.token.address,).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_disallow_token(&s.token.address);
+    assert!(deny.is_err());
+    assert!(s.escrow.is_token_allowed(&s.token.address));
+
+    // The admin's own signature succeeds.
+    s.escrow
+        .mock_auths(&[MockAuth {
+            address: &s.admin,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "allow_token",
+                args: (&other.address,).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .allow_token(&other.address);
+    assert!(s.escrow.is_token_allowed(&other.address));
 }

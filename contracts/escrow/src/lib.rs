@@ -83,6 +83,7 @@ pub enum EscrowError {
     InvalidPanel = 31,
     PanelRequired = 32,
     RoleUnchanged = 33,
+    TokenNotAllowed = 34,
 }
 
 #[contracttype]
@@ -230,6 +231,7 @@ enum DataKey {
     Panel,
     Votes(u64),
     RoleMember(Role, Address),
+    AllowedToken(Address),
 }
 
 #[contract]
@@ -277,6 +279,29 @@ fn set_role(env: &Env, role: Role, account: Address, member: bool) -> Result<(),
         .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
     env.events()
         .publish((symbol_short!("role_set"), role), (account, member));
+    Ok(())
+}
+
+fn token_allowed(env: &Env, token: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get::<_, bool>(&DataKey::AllowedToken(token.clone()))
+        .unwrap_or(false)
+}
+
+fn set_token_allowed(env: &Env, token: Address, allowed: bool) -> Result<(), EscrowError> {
+    require_admin(env)?;
+    let key = DataKey::AllowedToken(token.clone());
+    env.storage().persistent().set(&key, &allowed);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    let topic = if allowed {
+        symbol_short!("tok_allow")
+    } else {
+        symbol_short!("tok_deny")
+    };
+    env.events().publish((topic,), token);
     Ok(())
 }
 
@@ -491,7 +516,7 @@ fn build_escrow(
     require_not_paused(&env)?;
     client.require_auth();
 
-    // Validation order: parties -> milestones -> amounts.
+    // Validation order: parties -> token allowlist -> milestones -> amounts.
     // ---- Parties ----
     let contract_addr = env.current_contract_address();
     if client == contract_addr
@@ -504,6 +529,17 @@ fn build_escrow(
     if client == admin_addr || freelancer == admin_addr {
         return Err(EscrowError::AdminCannotBeParty);
     }
+
+    // ---- Token allowlist ----
+    // Only checked at creation: disallowing a token later never blocks
+    // deposits, releases, refunds or disputes on existing escrows.
+    if !token_allowed(&env, &token) {
+        return Err(EscrowError::TokenNotAllowed);
+    }
+    let token_key = DataKey::AllowedToken(token.clone());
+    env.storage()
+        .persistent()
+        .extend_ttl(&token_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
 
     // ---- Milestones ----
     let n = milestone_amounts.len();
@@ -1738,6 +1774,22 @@ impl Escrow {
     /// Revoke a role from an account. Admin only; `RoleUnchanged` if not a member.
     pub fn revoke_role(env: Env, role: Role, account: Address) -> Result<(), EscrowError> {
         set_role(&env, role, account, false)
+    }
+
+    /// Admin only: allow escrows to be created in `token`. Emits `("tok_allow",) -> token`.
+    pub fn allow_token(env: Env, token: Address) -> Result<(), EscrowError> {
+        set_token_allowed(&env, token, true)
+    }
+
+    /// Admin only: stop new escrows in `token`. Existing escrows are unaffected.
+    /// Emits `("tok_deny",) -> token`.
+    pub fn disallow_token(env: Env, token: Address) -> Result<(), EscrowError> {
+        set_token_allowed(&env, token, false)
+    }
+
+    /// Whether new escrows may be created in `token`.
+    pub fn is_token_allowed(env: Env, token: Address) -> bool {
+        token_allowed(&env, &token)
     }
 
     /// Role membership read; the admin implicitly holds every role.

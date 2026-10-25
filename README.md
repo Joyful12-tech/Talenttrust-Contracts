@@ -27,7 +27,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | Function | Auth | Description |
 | --- | --- | --- |
 | `initialize(admin)` | admin | One-time setup |
-| `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones. Rejects self-referential parties (client, freelancer or token equal to the contract address), the admin as client or freelancer, milestones below `MIN_MILESTONE_AMOUNT` (1 000 000), and totals above `MAX_ESCROW_TOTAL` (10¹⁸). Validation order: parties → milestones → amounts. |
+| `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones. Rejects self-referential parties (client, freelancer or token equal to the contract address), the admin as client or freelancer, tokens not on the admin allowlist (`TokenNotAllowed` (`34`)), milestones below `MIN_MILESTONE_AMOUNT` (1 000 000), and totals above `MAX_ESCROW_TOTAL` (10¹⁸). Validation order: parties → token allowlist → milestones → amounts. |
 | `create_contract_sequential(client, freelancer, token, milestone_amounts) -> u64` | client | Same as `create_contract`, but milestones must be released strictly in order (`OutOfOrder` (`28`) otherwise); emits `("seq", id) -> true` |
 | `deposit_funds(id, amount)` | client | Transfer tokens into escrow (status must be `Created`, cannot exceed total) |
 | `set_team_split(id, payees)` | freelancer | Configure 1-5 fixed-bps payee shares (sum 10,000) while `Created` and before any deposit (`InvalidSplitConfig` (`27`) otherwise); emits `("team", id) -> len` |
@@ -49,6 +49,8 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `set_paused(caller, paused)` / `is_paused()` | admin or Pauser / - | Circuit breaker for all mutations |
 | `grant_role(role, account)` / `revoke_role(role, account)` | admin | Grant or revoke a `Pauser` or `Resolver` role (`RoleUnchanged` (`33`) if no change); emits `("role_set", role) -> (account, true\|false)` |
 | `has_role(role, account)` | - | Role membership; the admin implicitly holds every role |
+| `allow_token(token)` / `disallow_token(token)` | admin | Add or remove a token (e.g. USDC / XLM SAC) from the escrow currency allowlist; emits `("tok_allow",) -> token` / `("tok_deny",) -> token`. Disallowing only blocks new escrows: deposits, releases, refunds and disputes on existing escrows in that token keep working |
+| `is_token_allowed(token) -> bool` | - | Whether new escrows may be created in `token` |
 | `get_contract(id)`, `get_rating(id)`, `contract_count()`, `get_reputation(addr)`, `get_outcomes(addr)`, `get_admin()`, `version()` | - | Reads |
 | `get_bonus(id)`, `get_bonus_total(freelancer)` | - | Reads for cumulative bonus amounts |
 | `next_releasable(id) -> Option<u32>` | - | Lowest unreleased milestone index (`None` when all released) |
@@ -85,6 +87,8 @@ Bonuses are allowed while an escrow is `Funded` or `Completed`; they do not chan
 | Event | Topic | Data |
 | --- | --- | --- |
 | Bonus paid | `("bonus", id)` | `(amount, cumulative)` |
+| Token allowed | `("tok_allow",)` | `token` |
+| Token disallowed | `("tok_deny",)` | `token` |
 
 Bonus payments reuse the escrow's existing validation errors: a missing escrow `id`, an escrow in a disallowed state (`Disputed`, `Cancelled`, `Resolved`), a non-positive `amount`, an unauthorized caller (client auth required), and the pause gate all return the corresponding contract error.
 
@@ -131,6 +135,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 31 | `InvalidPanel` | `set_panel` — bad threshold/size or duplicate members |
 | 32 | `PanelRequired` | `resolve_dispute` on an escrow with `total_amount >= PANEL_THRESHOLD_AMOUNT` (10^12) — settle via `vote_resolution` |
 | 33 | `RoleUnchanged` | `grant_role` on an existing member / `revoke_role` on a non-member |
+| 34 | `TokenNotAllowed` | `create_contract` / `create_contract_sequential` with a token not on the admin allowlist |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 
