@@ -53,6 +53,9 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `deliver(id, index, delivery_hash)` | freelancer | Record/overwrite a milestone's delivery hash until it is released; emits `("deliver", id) -> (index, delivery_hash)` |
 | `expire_unfunded(id)` | anyone | After the 14-day funding window (`FUNDING_WINDOW_SECS`), cancel an escrow still `Created` with nothing released and refund any partial deposit to its funders; emits `("expired", id) -> refund`. `NotExpired` (`36`) before the deadline |
 | `cancel_contract(id)` | client | Refund unreleased funds and close (increments `cancellations` if funds held); funds backing submitted milestones stay in escrow for the freelancer to claim |
+| `propose_settlement(id, proposer, freelancer_amount)` / `withdraw_settlement(id, proposer)` | client or freelancer | Propose (or withdraw) a split of the held balance (`0..=funded-released`, else `InvalidAmount`) on a `Created`/`Funded`/`Disputed` escrow; any later deposit or release invalidates it. Emits `("settle_p", id) -> (proposer, freelancer_amount)` |
+| `accept_settlement(id, acceptor, freelancer_amount)` | the other party | Accept by echoing the amount (`SettlementMismatch` (`48`) on self-accept, missing proposal or a different amount); pays both sides, returns any dispute bond and closes the escrow as `Resolved` without the admin. Emits `("settled", id) -> (to_freelancer, to_client)` |
+| `get_settlement(id)` | - | Pending `SettlementProposal { proposer, freelancer_amount, created_at }` |
 | `resign(id)` | freelancer | Resign from a `Created`/`Funded` escrow: unreleased funds return to the client (released milestones stay paid), escrow `Cancelled`; emits `("resign", id) -> refunded` |
 | `was_resigned(id)` | - | Whether the escrow ended by freelancer resignation (vs client cancellation) |
 | `issue_reputation(id, rating)` | client | Rate a completed or resolved job (1-5), once |
@@ -203,6 +206,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 45 | `InvalidAdmin` | `propose_admin` with the current admin |
 | 46 | `NoPendingAdmin` | `accept_admin` / `cancel_admin_proposal` without a nomination |
 | 47 | `EmergencyExitNotAvailable` | `emergency_withdraw` while unpaused or before the pause delay elapsed |
+| 48 | `SettlementMismatch` | `accept_settlement` self-accept, without a proposal, or with a different amount |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 

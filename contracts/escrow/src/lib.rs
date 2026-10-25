@@ -129,6 +129,7 @@ pub enum EscrowError {
     InvalidAdmin = 45,
     NoPendingAdmin = 46,
     EmergencyExitNotAvailable = 47,
+    SettlementMismatch = 48,
 }
 
 #[contracttype]
@@ -329,6 +330,15 @@ pub struct CompletedEvent {
     pub released_amount: i128,
 }
 
+/// A pending two-party mutual settlement proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementProposal {
+    pub proposer: Address,
+    pub freelancer_amount: i128,
+    pub created_at: u64,
+}
+
 /// Delegated operational roles. The admin implicitly holds every role.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -418,6 +428,7 @@ enum DataKey {
     /// Ledger timestamp at which the current continuous pause began.
     PausedAt,
     Resigned(u64),
+    Settlement(u64),
 }
 
 #[contract]
@@ -916,6 +927,10 @@ fn review_window(env: &Env, id: u64) -> u64 {
         .unwrap_or(DEFAULT_REVIEW_WINDOW_SECS)
 }
 
+fn clear_settlement(env: &Env, id: u64) {
+    env.storage().persistent().remove(&DataKey::Settlement(id));
+}
+
 fn is_sequential(env: &Env, id: u64) -> bool {
     env.storage()
         .persistent()
@@ -1154,6 +1169,8 @@ fn apply_deposit(
     if c.funded_amount == c.total_amount {
         transition(c, ContractStatus::Funded)?;
     }
+    // A deposit changes the held balance: drop any outstanding settlement proposal.
+    clear_settlement(env, c.id);
     add_liability(env, &c.token, amount)?;
     #[cfg(any(test, debug_assertions))]
     assert_solvent(env, &c.token);
@@ -1830,6 +1847,7 @@ impl Escrow {
             transition(&mut c, ContractStatus::Completed)?;
             record_closed_at(&env, id);
         }
+        clear_settlement(&env, id);
         sub_liability(&env, &c.token, remaining)?;
         #[cfg(any(test, debug_assertions))]
         assert_solvent(&env, &c.token);
@@ -1912,6 +1930,7 @@ impl Escrow {
             transition(&mut c, ContractStatus::Completed)?;
             record_closed_at(&env, id);
         }
+        clear_settlement(&env, id);
         sub_liability(&env, &c.token, remaining)?;
         #[cfg(any(test, debug_assertions))]
         assert_solvent(&env, &c.token);
@@ -1974,6 +1993,7 @@ impl Escrow {
         } else {
             set_milestone_paid(&env, id, index, new_paid);
         }
+        clear_settlement(&env, id);
         sub_liability(&env, &c.token, amount)?;
         #[cfg(any(test, debug_assertions))]
         assert_solvent(&env, &c.token);
@@ -2079,6 +2099,7 @@ impl Escrow {
             transition(&mut c, ContractStatus::Completed)?;
             record_closed_at(&env, id);
         }
+        clear_settlement(&env, id);
         sub_liability(&env, &c.token, total)?;
         #[cfg(any(test, debug_assertions))]
         assert_solvent(&env, &c.token);
@@ -2610,6 +2631,152 @@ impl Escrow {
             .persistent()
             .get(&DataKey::FundBy(id))
             .unwrap_or(0)
+    }
+
+    /// A party proposes a mutual settlement of the held balance: `freelancer_amount`
+    /// to the freelancer and the rest to the client (`0 <= freelancer_amount <=
+    /// funded - released`, else `InvalidAmount`). Allowed on `Created`, `Funded`
+    /// and `Disputed` escrows; replaces any earlier proposal. Emits
+    /// `("settle_p", id) -> (proposer, freelancer_amount)`.
+    pub fn propose_settlement(
+        env: Env,
+        id: u64,
+        proposer: Address,
+        freelancer_amount: i128,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        proposer.require_auth();
+        if proposer != c.client && proposer != c.freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if !matches!(
+            c.status,
+            ContractStatus::Created | ContractStatus::Funded | ContractStatus::Disputed
+        ) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let held = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        if freelancer_amount < 0 || freelancer_amount > held {
+            return Err(EscrowError::InvalidAmount);
+        }
+        let key = DataKey::Settlement(id);
+        env.storage().persistent().set(
+            &key,
+            &SettlementProposal {
+                proposer: proposer.clone(),
+                freelancer_amount,
+                created_at: env.ledger().timestamp(),
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events()
+            .publish((symbol_short!("settle_p"), id), (proposer, freelancer_amount));
+        Ok(())
+    }
+
+    /// The *other* party accepts the pending settlement, echoing the proposed
+    /// `freelancer_amount` (guards against a swapped proposal); a missing
+    /// proposal, self-acceptance or a different amount fail with
+    /// `SettlementMismatch`. Pays both sides, returns any dispute bond to its
+    /// opener and closes the escrow as `Resolved` without the admin. Emits
+    /// `("settled", id) -> (to_freelancer, to_client)`.
+    pub fn accept_settlement(
+        env: Env,
+        id: u64,
+        acceptor: Address,
+        freelancer_amount: i128,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        acceptor.require_auth();
+        if acceptor != c.client && acceptor != c.freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+        let key = DataKey::Settlement(id);
+        let proposal: SettlementProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::SettlementMismatch)?;
+        if acceptor == proposal.proposer || freelancer_amount != proposal.freelancer_amount {
+            return Err(EscrowError::SettlementMismatch);
+        }
+        if !matches!(
+            c.status,
+            ContractStatus::Created | ContractStatus::Funded | ContractStatus::Disputed
+        ) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let held = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        if freelancer_amount > held {
+            return Err(EscrowError::InvalidAmount);
+        }
+        let to_freelancer = freelancer_amount;
+        let to_client = held - to_freelancer;
+        env.storage().persistent().remove(&key);
+        pay_out(&env, &c, to_freelancer)?;
+        refund_funders(&env, &c, to_client)?;
+        c.released_amount = c
+            .released_amount
+            .checked_add(to_freelancer)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        c.refunded_amount = to_client;
+        c.funded_amount = c.released_amount;
+        // Dedicated mutual-settlement edge (outside the admin-driven lifecycle
+        // machine): Created / Funded / Disputed -> Resolved, by both parties.
+        c.status = ContractStatus::Resolved;
+        record_closed_at(&env, id);
+        sub_liability(&env, &c.token, held)?;
+        let bond_key = DataKey::DisputeBond(id);
+        if let Some((opener, bond)) = env
+            .storage()
+            .persistent()
+            .get::<_, (Address, i128)>(&bond_key)
+        {
+            env.storage().persistent().remove(&bond_key);
+            transfer_checked(&env, &c.token, &env.current_contract_address(), &opener, bond)?;
+            sub_liability(&env, &c.token, bond)?;
+        }
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
+        save(&env, &c);
+        env.events()
+            .publish((symbol_short!("settled"), id), (to_freelancer, to_client));
+        Ok(())
+    }
+
+    /// The proposer withdraws its pending settlement proposal.
+    pub fn withdraw_settlement(env: Env, id: u64, proposer: Address) -> Result<(), EscrowError> {
+        load(&env, id)?;
+        proposer.require_auth();
+        let key = DataKey::Settlement(id);
+        let proposal: SettlementProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::SettlementMismatch)?;
+        if proposal.proposer != proposer {
+            return Err(EscrowError::Unauthorized);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish((symbol_short!("settle_w"), id), proposer);
+        Ok(())
+    }
+
+    /// Pending settlement proposal, if any.
+    pub fn get_settlement(env: Env, id: u64) -> Option<SettlementProposal> {
+        env.storage().persistent().get(&DataKey::Settlement(id))
     }
 
     /// Freelancer resigns from a `Created` / `Funded` escrow: all unreleased

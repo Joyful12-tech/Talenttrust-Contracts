@@ -6372,3 +6372,235 @@ fn resign_emits_event_and_is_not_a_client_cancellation() {
     s.escrow.set_paused(&s.admin, &true);
     assert_eq!(s.escrow.try_resign(&id2), Err(Ok(EscrowError::Paused)));
 }
+
+// ---------------------------------------------------------------------------
+// Two-party mutual settlement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn client_proposes_freelancer_accepts_settlement() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(200 * U));
+
+    s.escrow.propose_settlement(&id, &s.client, &(100 * U));
+    let proposal = s.escrow.get_settlement(&id).unwrap();
+    assert_eq!(proposal.proposer, s.client);
+    assert_eq!(proposal.freelancer_amount, 100 * U);
+
+    s.escrow.accept_settlement(&id, &s.freelancer, &(100 * U));
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    assert_eq!(s.token.balance(&s.client), 900 * U);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Resolved);
+    assert!(s.escrow.get_settlement(&id).is_none());
+}
+
+#[test]
+fn freelancer_proposes_client_accepts_settlement() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(200 * U));
+
+    s.escrow.propose_settlement(&id, &s.freelancer, &(150 * U));
+    s.escrow.accept_settlement(&id, &s.client, &(150 * U));
+    assert_eq!(s.token.balance(&s.freelancer), 150 * U);
+    assert_eq!(s.token.balance(&s.client), 850 * U);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Resolved);
+}
+
+#[test]
+fn proposer_cannot_self_accept_settlement() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(200 * U));
+    s.escrow.propose_settlement(&id, &s.client, &(100 * U));
+
+    assert_eq!(
+        s.escrow.try_accept_settlement(&id, &s.client, &(100 * U)),
+        Err(Ok(EscrowError::SettlementMismatch))
+    );
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+}
+
+#[test]
+fn settlement_mismatched_amount_rejected() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(200 * U));
+    s.escrow.propose_settlement(&id, &s.client, &(100 * U));
+
+    assert_eq!(
+        s.escrow.try_accept_settlement(&id, &s.freelancer, &(50 * U)),
+        Err(Ok(EscrowError::SettlementMismatch))
+    );
+    assert_eq!(s.token.balance(&s.freelancer), 0);
+    assert_eq!(s.token.balance(&s.client), 800 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+}
+
+#[test]
+fn settlement_invalidated_by_release() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(200 * U));
+    s.escrow.propose_settlement(&id, &s.client, &(100 * U));
+    s.escrow.release_milestone(&id, &0);
+    assert!(s.escrow.get_settlement(&id).is_none());
+
+    assert_eq!(
+        s.escrow.try_accept_settlement(&id, &s.freelancer, &(100 * U)),
+        Err(Ok(EscrowError::SettlementMismatch))
+    );
+}
+
+#[test]
+fn settlement_from_disputed_blocks_admin_resolution() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(200 * U));
+    open_dispute_bonded(&s, &id, &s.client);
+
+    s.escrow.propose_settlement(&id, &s.freelancer, &(120 * U));
+    s.escrow.accept_settlement(&id, &s.client, &(120 * U));
+    assert_eq!(s.token.balance(&s.freelancer), 120 * U);
+    // The client opener also gets its dispute bond back.
+    assert_eq!(s.token.balance(&s.client), 880 * U + dispute_bond(200 * U));
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Resolved);
+
+    assert_eq!(
+        s.escrow.try_resolve_dispute(&s.admin, &id, &5_000, &true),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+    assert_eq!(s.escrow.get_dispute_bond(&id), None);
+}
+
+#[test]
+fn withdraw_settlement_removes_proposal() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(200 * U));
+    s.escrow.propose_settlement(&id, &s.client, &(100 * U));
+    s.escrow.withdraw_settlement(&id, &s.client);
+    assert!(s.escrow.get_settlement(&id).is_none());
+    assert_eq!(
+        s.escrow.try_accept_settlement(&id, &s.freelancer, &(100 * U)),
+        Err(Ok(EscrowError::SettlementMismatch))
+    );
+}
+
+#[test]
+fn settlement_amount_out_of_bounds_rejected() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(200 * U));
+    assert_eq!(
+        s.escrow.try_propose_settlement(&id, &s.client, &(200 * U + 1)),
+        Err(Ok(EscrowError::InvalidAmount))
+    );
+    assert_eq!(
+        s.escrow.try_propose_settlement(&id, &s.client, &-1),
+        Err(Ok(EscrowError::InvalidAmount))
+    );
+}
+
+
+#[test]
+fn settlement_invalidated_by_deposit_and_events_emitted() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.propose_settlement(&id, &s.freelancer, &(60 * U));
+    let ev = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.escrow.address)
+        .last()
+        .unwrap();
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &ev.1.get(0).unwrap()).unwrap(),
+        symbol_short!("settle_p")
+    );
+    s.escrow.deposit_funds(&id, &(50 * U));
+    assert!(s.escrow.get_settlement(&id).is_none());
+    s.escrow.propose_settlement(&id, &s.client, &(50 * U));
+    s.escrow.accept_settlement(&id, &s.freelancer, &(50 * U));
+    let ev = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.escrow.address)
+        .last()
+        .unwrap();
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &ev.1.get(0).unwrap()).unwrap(),
+        symbol_short!("settled")
+    );
+    assert_eq!(
+        <(i128, i128)>::try_from_val(&s.env, &ev.2).unwrap(),
+        (50 * U, 100 * U)
+    );
+    assert_eq!(s.escrow.get_liability(&s.token.address), 0);
+    // A stranger cannot propose or accept
+    let stranger = Address::generate(&s.env);
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 200 * U],
+    );
+    assert_eq!(
+        s.escrow.try_propose_settlement(&id2, &stranger, &0),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+}
