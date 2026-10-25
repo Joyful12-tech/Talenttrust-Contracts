@@ -7216,3 +7216,176 @@ fn party_index_pages_never_exceed_page_size() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Linear vesting stream escrows
+// ---------------------------------------------------------------------------
+
+fn at_time(env: &Env, ts: u64) {
+    env.ledger().with_mut(|li| li.timestamp = ts);
+}
+
+#[test]
+fn stream_vesting_boundaries_are_exact() {
+    let s = setup();
+    let id = s.escrow.create_stream(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &1_000_001,
+        &10_000,
+        &13_600,
+    );
+    let cases: [(u64, i128); 6] = [
+        (9_999, 0),
+        (10_000, 0),
+        (11_800, 500_000),
+        (13_599, 999_723),
+        (13_600, 1_000_001),
+        (13_601, 1_000_001),
+    ];
+    for (ts, want) in cases.iter() {
+        at_time(&s.env, *ts);
+        assert_eq!(s.escrow.vested(&id), *want, "at {}", ts);
+    }
+    assert_eq!(
+        s.escrow.get_stream(&id),
+        Stream {
+            start: 10_000,
+            end: 13_600,
+            withdrawn: 0,
+            stopped_at: None,
+        }
+    );
+}
+
+#[test]
+fn stream_withdrawals_sum_to_amount() {
+    let s = setup();
+    let id = s.escrow.create_stream(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &(100 * U),
+        &0,
+        &10_000,
+    );
+    // Withdraw before funding is rejected.
+    at_time(&s.env, 2_500);
+    assert_eq!(
+        s.escrow.try_withdraw_vested(&id),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    assert_eq!(s.escrow.withdraw_vested(&id), 25 * U);
+    at_time(&s.env, 5_000);
+    assert_eq!(s.escrow.withdraw_vested(&id), 25 * U);
+    at_time(&s.env, 10_000);
+    assert_eq!(s.escrow.withdraw_vested(&id), 50 * U);
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Completed);
+    check_invariants(&c);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+}
+
+#[test]
+fn stop_stream_at_40_percent_pays_40_60() {
+    let s = setup();
+    let id = s.escrow.create_stream(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &(100 * U),
+        &0,
+        &10_000,
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    at_time(&s.env, 4_000);
+    s.escrow.stop_stream(&id);
+    assert_eq!(s.token.balance(&s.freelancer), 40 * U);
+    assert_eq!(s.token.balance(&s.client), 1_000 * U - 40 * U);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Cancelled);
+    check_invariants(&c);
+    // Vesting is frozen at the stop time.
+    at_time(&s.env, 9_000);
+    assert_eq!(s.escrow.vested(&id), 40 * U);
+    // Double stop rejected
+    assert_eq!(
+        s.escrow.try_stop_stream(&id),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+}
+
+#[test]
+fn stream_auth_schedule_and_milestone_api_guards() {
+    let s = setup();
+    assert_eq!(
+        s.escrow.try_create_stream(
+            &s.client,
+            &s.freelancer,
+            &s.token.address,
+            &(100 * U),
+            &100,
+            &(100 + MIN_STREAM_SECS - 1),
+        ),
+        Err(Ok(EscrowError::InvalidSchedule))
+    );
+    assert_eq!(
+        s.escrow.try_create_stream(
+            &s.client,
+            &s.freelancer,
+            &s.token.address,
+            &(100 * U),
+            &100,
+            &100,
+        ),
+        Err(Ok(EscrowError::InvalidSchedule))
+    );
+    let id = s.escrow.create_stream(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &(100 * U),
+        &0,
+        &10_000,
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    at_time(&s.env, 5_000);
+    // Streams do not use milestone releases or cancel.
+    assert_eq!(
+        s.escrow.try_release_milestone(&id, &0),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+    assert_eq!(
+        s.escrow.try_cancel_contract(&id),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+    // The client cannot withdraw the freelancer's vested pay.
+    s.env.mock_auths(&[MockAuth {
+        address: &s.client,
+        invoke: &MockAuthInvoke {
+            contract: &s.escrow.address,
+            fn_name: "withdraw_vested",
+            args: (id,).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.escrow.try_withdraw_vested(&id).is_err());
+    s.env.mock_all_auths();
+    assert_eq!(s.token.balance(&s.freelancer), 0);
+}
+
+#[test]
+fn vesting_math_is_overflow_safe() {
+    let env = Env::default();
+    let amount = i128::MAX / 2;
+    assert_eq!(
+        vested_at(&env, amount, 0, u64::MAX, u64::MAX / 2),
+        42_535_295_865_117_307_930_615_982_919_757_332_479
+    );
+    assert_eq!(vested_at(&env, amount, 0, u64::MAX, u64::MAX), amount);
+    assert_eq!(vested_at(&env, amount, 5, 10, 0), 0);
+}

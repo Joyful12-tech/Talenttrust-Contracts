@@ -30,6 +30,10 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones. Rejects self-referential parties (client, freelancer or token equal to the contract address), the admin as client or freelancer, milestones below `MIN_MILESTONE_AMOUNT` (1 000 000), and totals above `MAX_ESCROW_TOTAL` (10¹⁸). Validation order: parties → milestones → amounts. |
 | `create_and_fund(client, freelancer, token, milestone_amounts) -> u64` | client | Validate, create and fully fund an escrow atomically (one signature, one escrow write; same validation as `create_contract`); emits `created` then `deposit` with the two-step payloads |
 | `create_contract_sequential(client, freelancer, token, milestone_amounts) -> u64` | client | Same as `create_contract`, but milestones must be released strictly in order (`OutOfOrder` (`28`) otherwise); emits `("seq", id) -> true` |
+| `create_stream(client, freelancer, token, amount, start, end) -> u64` | client | One-milestone escrow vesting linearly from `start` to `end` (`end - start >= 1 hour`, else `InvalidSchedule` (`50`)); funded with `deposit_funds`; milestone releases and `cancel_contract` return `InvalidStatus` |
+| `withdraw_vested(id) -> i128` | freelancer | Withdraw vested-but-unwithdrawn pay from a `Funded` stream; completes the escrow when fully vested. Emits `("stream_wd", id) -> amount` |
+| `stop_stream(id)` | client | Stop the stream: vested-but-unwithdrawn to the freelancer, unvested remainder refunded, escrow `Cancelled`. Emits `("stream_st", id) -> (to_freelancer, to_client)` |
+| `vested(id)`, `get_stream(id)` | - | Vested amount (`amount * (min(now, stop_or_end) - start) / (end - start)`, overflow-safe) and the `Stream { start, end, withdrawn, stopped_at }` schedule |
 | `deposit_funds(id, amount)` | client | Transfer tokens into escrow (status must be `Created`, cannot exceed total) |
 | `deposit_from(id, funder, amount)` | funder | Any address funds the escrow (same checks as `deposit_funds`); contributions are tracked per funder (max 10, else `TooManyFunders` (`34`)) and refunds from `cancel_contract` / the client share of a dispute are split pro-rata among funders, rounding remainder to the largest funder. `deposit` event payload is `(funder, amount)` |
 | `set_team_split(id, payees)` | freelancer | Configure 1-5 fixed-bps payee shares (sum 10,000) while `Created` and before any deposit (`InvalidSplitConfig` (`27`) otherwise); emits `("team", id) -> len` |
@@ -222,6 +226,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 47 | `EmergencyExitNotAvailable` | `emergency_withdraw` while unpaused or before the pause delay elapsed |
 | 48 | `SettlementMismatch` | `accept_settlement` self-accept, without a proposal, or with a different amount |
 | 49 | `FeeTooHigh` | `set_fee` above `MAX_FEE_BPS` |
+| 50 | `InvalidSchedule` | `create_stream` with `start >= end` or a duration under 1 hour |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 
