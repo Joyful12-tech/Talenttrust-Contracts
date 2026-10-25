@@ -81,6 +81,8 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `get_milestone_paid(id, index) -> i128` | - | Amount paid so far on a milestone (its full amount once released) |
 | `next_releasable(id) -> Option<u32>` | - | Lowest unreleased milestone index (`None` when all released) |
 | `migrate_escrows(ids) -> u32` | anyone | Eagerly move up to 50 legacy `Contract(id)` entries to the versioned `ContractV(id)` envelope (`InvalidAmount` above 50); already-migrated/unknown ids are skipped; returns the number migrated. Legacy entries are otherwise migrated lazily by their first mutation; reads never write |
+| `get_client_escrows(client, start, limit)`, `get_freelancer_escrows(freelancer, start, limit)` | - | Escrow ids per party in creation order; `limit` clamped to 50 (`ESCROW_INDEX_PAGE_SIZE`), zero limit or out-of-range start returns empty. Stored in pages of at most 50 ids; escrows created before this index are not backfilled |
+| `count_client_escrows(client)`, `count_freelancer_escrows(freelancer)` | - | Number of indexed escrows per party |
 | `get_milestone(id, index)` | - | Single milestone; `MilestoneNotFound` when out of range |
 | `get_escrow_summary(id)` | - | Status and derived balances (`held`, `remaining_to_fund`, milestone counts, next unreleased index, whether the held balance covers it) |
 | `get_escrow_summaries(ids)` | - | Up to 25 summaries; unknown ids skipped, larger batches return `InvalidAmount` |

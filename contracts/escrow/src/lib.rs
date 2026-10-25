@@ -29,6 +29,9 @@ pub const MAX_MILESTONES: u32 = 20;
 pub const MAX_SUMMARY_BATCH: u32 = 25;
 /// Maximum number of escrow ids accepted by a single `migrate_escrows` call.
 pub const MAX_MIGRATE_BATCH: u32 = 50;
+/// Maximum number of escrow ids stored in a single per-party index entry and
+/// the maximum page size returned by the paginated index read APIs.
+pub const ESCROW_INDEX_PAGE_SIZE: u32 = 50;
 pub const BPS_DENOMINATOR: i128 = 10_000;
 /// 48-hour time-lock delay before a scheduled WASM upgrade can be executed.
 pub const UPGRADE_DELAY_SECS: u64 = 172_800;
@@ -447,6 +450,14 @@ enum DataKey {
     Treasury,
     /// Fee rate (bps) snapshotted for an escrow at creation.
     EscrowFee(u64),
+    /// Number of escrows created by this client.
+    ClientEscrows(Address),
+    /// Number of escrows created for this freelancer.
+    FreelancerEscrows(Address),
+    /// Page of escrow ids (at most `ESCROW_INDEX_PAGE_SIZE`) for a client.
+    ClientPage(Address, u32),
+    /// Page of escrow ids (at most `ESCROW_INDEX_PAGE_SIZE`) for a freelancer.
+    FreelancerPage(Address, u32),
 }
 
 #[contract]
@@ -963,6 +974,8 @@ fn build_escrow(
         assert_solvent(&env, &c.token);
     }
     save(&env, &c);
+    append_party_index(&env, &c.client, id, true)?;
+    append_party_index(&env, &c.freelancer, id, false)?;
     events::created(&env, &c);
     if fund_now {
         events::deposit(&env, &c, &client, total);
@@ -1046,6 +1059,111 @@ fn review_window(env: &Env, id: u64) -> u64 {
 
 fn clear_settlement(env: &Env, id: u64) {
     env.storage().persistent().remove(&DataKey::Settlement(id));
+}
+
+fn index_count_key(party: &Address, is_client: bool) -> DataKey {
+    if is_client {
+        DataKey::ClientEscrows(party.clone())
+    } else {
+        DataKey::FreelancerEscrows(party.clone())
+    }
+}
+
+fn index_page_key(party: &Address, page: u32, is_client: bool) -> DataKey {
+    if is_client {
+        DataKey::ClientPage(party.clone(), page)
+    } else {
+        DataKey::FreelancerPage(party.clone(), page)
+    }
+}
+
+/// Append `id` to a party's escrow index, splitting the index into fixed-size
+/// pages so no single persistent entry grows without bound.
+fn append_party_index(
+    env: &Env,
+    party: &Address,
+    id: u64,
+    is_client: bool,
+) -> Result<(), EscrowError> {
+    let count_key = index_count_key(party, is_client);
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let next_count = count
+        .checked_add(1)
+        .ok_or(EscrowError::ArithmeticOverflow)?;
+
+    let page_index = count / ESCROW_INDEX_PAGE_SIZE;
+    let page_key = index_page_key(party, page_index, is_client);
+    let mut page: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&page_key)
+        .unwrap_or_else(|| Vec::new(env));
+    page.push_back(id);
+    env.storage().persistent().set(&page_key, &page);
+    env.storage().persistent().extend_ttl(
+        &page_key,
+        PERSISTENT_TTL_THRESHOLD,
+        PERSISTENT_TTL_EXTEND,
+    );
+
+    env.storage().persistent().set(&count_key, &next_count);
+    env.storage().persistent().extend_ttl(
+        &count_key,
+        PERSISTENT_TTL_THRESHOLD,
+        PERSISTENT_TTL_EXTEND,
+    );
+    Ok(())
+}
+
+fn party_index_count(env: &Env, party: &Address, is_client: bool) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&index_count_key(party, is_client))
+        .unwrap_or(0)
+}
+
+/// Read `limit` escrow ids starting at `start`, in creation order. `limit` is
+/// clamped to [`ESCROW_INDEX_PAGE_SIZE`]; an out-of-range start or a zero limit
+/// returns an empty vector.
+fn read_party_index(
+    env: &Env,
+    party: &Address,
+    start: u32,
+    limit: u32,
+    is_client: bool,
+) -> Vec<u64> {
+    let mut ids = Vec::new(env);
+    let count = party_index_count(env, party, is_client);
+    if limit == 0 || start >= count {
+        return ids;
+    }
+
+    let end = start
+        .saturating_add(core::cmp::min(limit, ESCROW_INDEX_PAGE_SIZE))
+        .min(count);
+    let mut cursor = start;
+    while cursor < end {
+        let page_index = cursor / ESCROW_INDEX_PAGE_SIZE;
+        let page_start = page_index * ESCROW_INDEX_PAGE_SIZE;
+        let page_key = index_page_key(party, page_index, is_client);
+        let page: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&page_key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let first = cursor - page_start;
+        let last = core::cmp::min(end - page_start, ESCROW_INDEX_PAGE_SIZE);
+        let mut i = first;
+        while i < last {
+            if let Some(id) = page.get(i) {
+                ids.push_back(id);
+            }
+            i += 1;
+        }
+        cursor = page_start + last;
+    }
+    ids
 }
 
 fn is_sequential(env: &Env, id: u64) -> bool {
@@ -3334,6 +3452,39 @@ impl Escrow {
             extend_if_present(&env, key);
         }
         bump_instance(&env);
+    }
+
+    /// Returns the number of escrows created by `client`.
+    pub fn count_client_escrows(env: Env, client: Address) -> u32 {
+        party_index_count(&env, &client, true)
+    }
+
+    /// Returns the number of escrows created for `freelancer`.
+    pub fn count_freelancer_escrows(env: Env, freelancer: Address) -> u32 {
+        party_index_count(&env, &freelancer, false)
+    }
+
+    /// Returns up to `limit` escrow ids created by `client`, in creation order.
+    ///
+    /// `limit` is clamped to [`ESCROW_INDEX_PAGE_SIZE`] (50). A `start` at or
+    /// beyond the party's escrow count, or a `limit` of zero, returns an empty
+    /// vector. Ids created before this index was deployed are not backfilled.
+    pub fn get_client_escrows(env: Env, client: Address, start: u32, limit: u32) -> Vec<u64> {
+        read_party_index(&env, &client, start, limit, true)
+    }
+
+    /// Returns up to `limit` escrow ids created for `freelancer`, in creation order.
+    ///
+    /// `limit` is clamped to [`ESCROW_INDEX_PAGE_SIZE`] (50). A `start` at or
+    /// beyond the party's escrow count, or a `limit` of zero, returns an empty
+    /// vector. Ids created before this index was deployed are not backfilled.
+    pub fn get_freelancer_escrows(
+        env: Env,
+        freelancer: Address,
+        start: u32,
+        limit: u32,
+    ) -> Vec<u64> {
+        read_party_index(&env, &freelancer, start, limit, false)
     }
 
     /// Returns a single milestone; `MilestoneNotFound` when out of range.
