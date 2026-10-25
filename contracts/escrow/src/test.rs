@@ -6229,3 +6229,146 @@ fn emergency_withdraw_pays_submitted_work_and_keeps_balances_consistent() {
     assert_eq!(s.token.balance(&s.escrow.address), 0);
     assert_eq!(s.token.balance(&s.client), 1_000 * U - 100 * U);
 }
+
+// ---------------------------------------------------------------------------
+// Freelancer resignation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resign_in_created_refunds_partial_deposit() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    // Partial deposit of 150 out of 300 required.
+    s.escrow.deposit_funds(&id, &(150 * U));
+    assert_eq!(s.token.balance(&s.client), 850 * U);
+    assert_eq!(s.token.balance(&s.freelancer), 0);
+    assert_eq!(s.token.balance(&s.escrow.address), 150 * U);
+
+    s.escrow.resign(&id);
+
+    assert_eq!(s.token.balance(&s.client), 1000 * U);
+    assert_eq!(s.token.balance(&s.freelancer), 0);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Cancelled);
+    assert!(s.escrow.was_resigned(&id));
+}
+
+#[test]
+fn resign_in_funded_after_one_release_refunds_remaining() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(300 * U));
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    assert_eq!(s.token.balance(&s.client), 700 * U);
+    assert_eq!(s.token.balance(&s.escrow.address), 200 * U);
+
+    s.escrow.resign(&id);
+
+    // Released milestone stays paid; remaining 200 refunded to client.
+    assert_eq!(s.token.balance(&s.client), 900 * U);
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Cancelled);
+    assert!(s.escrow.was_resigned(&id));
+}
+
+#[test]
+fn resign_while_disputed_rejected() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    open_dispute_bonded(&s, &id, &s.freelancer);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Disputed);
+    assert_eq!(
+        s.escrow.try_resign(&id),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+    // Held funds plus the opener's dispute bond stay in escrow.
+    assert_eq!(
+        s.token.balance(&s.escrow.address),
+        100 * U + dispute_bond(100 * U)
+    );
+    assert!(!s.escrow.was_resigned(&id));
+}
+
+
+#[test]
+fn client_calling_resign_rejected() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    // Only the client authorises: the freelancer's auth is missing.
+    s.env.mock_auths(&[MockAuth {
+        address: &s.client,
+        invoke: &MockAuthInvoke {
+            contract: &s.escrow.address,
+            fn_name: "resign",
+            args: (id,).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.escrow.try_resign(&id).is_err());
+    s.env.mock_all_auths();
+    assert_eq!(s.token.balance(&s.escrow.address), 100 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+    assert!(!s.escrow.was_resigned(&id));
+}
+
+#[test]
+fn resign_emits_event_and_is_not_a_client_cancellation() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(40 * U));
+    s.escrow.resign(&id);
+    let ev = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.escrow.address)
+        .last()
+        .unwrap();
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &ev.1.get(0).unwrap()).unwrap(),
+        symbol_short!("resign")
+    );
+    assert_eq!(u64::try_from_val(&s.env, &ev.1.get(1).unwrap()).unwrap(), id);
+    assert_eq!(i128::try_from_val(&s.env, &ev.2).unwrap(), 40 * U);
+    assert_eq!(s.escrow.get_outcomes(&s.client).cancellations, 0);
+    assert_eq!(s.escrow.get_liability(&s.token.address), 0);
+    // Paused contracts block resignation
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.set_paused(&s.admin, &true);
+    assert_eq!(s.escrow.try_resign(&id2), Err(Ok(EscrowError::Paused)));
+}

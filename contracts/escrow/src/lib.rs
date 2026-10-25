@@ -417,6 +417,7 @@ enum DataKey {
     PendingAdmin,
     /// Ledger timestamp at which the current continuous pause began.
     PausedAt,
+    Resigned(u64),
 }
 
 #[contract]
@@ -2609,6 +2610,48 @@ impl Escrow {
             .persistent()
             .get(&DataKey::FundBy(id))
             .unwrap_or(0)
+    }
+
+    /// Freelancer resigns from a `Created` / `Funded` escrow: all unreleased
+    /// funds go back to the client (pro-rata to funders), already released
+    /// milestones stay paid, and the escrow is `Cancelled`. Recorded separately
+    /// from client cancellations (`was_resigned`). Emits `("resign", id) -> refunded`.
+    pub fn resign(env: Env, id: u64) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        c.freelancer.require_auth();
+        if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let refund = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        refund_funders(&env, &c, refund)?;
+        c.refunded_amount = refund;
+        c.funded_amount = c.released_amount;
+        transition(&mut c, ContractStatus::Cancelled)?;
+        record_closed_at(&env, id);
+        sub_liability(&env, &c.token, refund)?;
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
+        save(&env, &c);
+        let key = DataKey::Resigned(id);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events().publish((symbol_short!("resign"), id), refund);
+        Ok(())
+    }
+
+    /// Whether an escrow ended through freelancer resignation.
+    pub fn was_resigned(env: Env, id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Resigned(id))
+            .unwrap_or(false)
     }
 
     /// Client cancels the agreement and recovers unreleased funds, except the
