@@ -145,6 +145,8 @@ pub enum EscrowError {
     SettlementMismatch = 48,
     FeeTooHigh = 49,
     InvalidSchedule = 50,
+    // NOTE: the Soroban contract spec caps an error enum at 50 cases, so new
+    // failure modes reuse the closest existing code (append-only numbering).
 }
 
 #[contracttype]
@@ -366,6 +368,15 @@ pub struct Stream {
     pub stopped_at: Option<u64>,
 }
 
+/// A pending mutual amendment of milestone amounts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Amendment {
+    pub proposer: Address,
+    pub new_amounts: Vec<i128>,
+    pub nonce: u32,
+}
+
 /// Minimum stream duration: 1 hour.
 pub const MIN_STREAM_SECS: u64 = 3_600;
 
@@ -474,6 +485,8 @@ enum DataKey {
     FreelancerPage(Address, u32),
     /// Linear vesting schedule of a stream escrow.
     Stream(u64),
+    Amendment(u64),
+    AmendNonce(u64),
 }
 
 #[contract]
@@ -1221,6 +1234,42 @@ pub fn vested_at(env: &Env, amount: i128, start: u64, end: u64, at: u64) -> i128
 fn stream_vested(env: &Env, c: &EscrowContract, stream: &Stream) -> i128 {
     let at = stream.stopped_at.unwrap_or_else(|| env.ledger().timestamp());
     vested_at(env, c.total_amount, stream.start, stream.end, at)
+}
+
+/// Validates amended milestone amounts against the escrow: same count,
+/// released milestones unchanged, unreleased ones >= `MIN_MILESTONE_AMOUNT`
+/// and >= what was already paid on them. Returns the new total.
+fn check_amendment(env: &Env, c: &EscrowContract, new_amounts: &Vec<i128>) -> Result<i128, EscrowError> {
+    if new_amounts.len() != c.milestones.len() {
+        return Err(EscrowError::InvalidMilestones);
+    }
+    let mut total: i128 = 0;
+    for (i, m) in c.milestones.iter().enumerate() {
+        let index = i as u32;
+        let amount = new_amounts.get(index).unwrap();
+        if m.released {
+            if amount != m.amount {
+                return Err(EscrowError::MilestoneAlreadyReleased);
+            }
+        } else {
+            if amount <= 0 {
+                return Err(EscrowError::InvalidAmount);
+            }
+            if amount < MIN_MILESTONE_AMOUNT {
+                return Err(EscrowError::MilestoneTooSmall);
+            }
+            if amount < milestone_paid(env, c.id, index) {
+                return Err(EscrowError::InvalidAmount);
+            }
+        }
+        total = total
+            .checked_add(amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+    }
+    if total > MAX_ESCROW_TOTAL {
+        return Err(EscrowError::InvalidAmount);
+    }
+    Ok(total)
 }
 
 fn is_sequential(env: &Env, id: u64) -> bool {
@@ -3505,6 +3554,8 @@ impl Escrow {
             DataKey::RatingWeight(id),
             DataKey::ClientRated(id),
             DataKey::Stream(id),
+            DataKey::Amendment(id),
+            DataKey::AmendNonce(id),
         ];
         for key in keys.iter() {
             extend_if_present(&env, key);
@@ -3717,6 +3768,147 @@ impl Escrow {
         env.events()
             .publish((symbol_short!("stream_st"), id), (to_freelancer, to_client));
         Ok(())
+    }
+
+    /// A party proposes new amounts for the escrow's milestones (same count;
+    /// released milestones must keep their amount, else
+    /// `MilestoneAlreadyReleased`). Only on `Created` / `Funded` escrows
+    /// (not streams). Replaces any pending amendment and returns its nonce.
+    /// Emits `("amend_p", id) -> (proposer, nonce)`.
+    pub fn propose_amendment(
+        env: Env,
+        id: u64,
+        proposer: Address,
+        new_amounts: Vec<i128>,
+    ) -> Result<u32, EscrowError> {
+        require_not_paused(&env, PAUSE_CREATE)?;
+        let c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        proposer.require_auth();
+        if proposer != c.client && proposer != c.freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) || is_stream(&env, id) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        check_amendment(&env, &c, &new_amounts)?;
+        let nonce_key = DataKey::AmendNonce(id);
+        let nonce: u32 = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&nonce_key)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&nonce_key, &nonce);
+        env.storage()
+            .persistent()
+            .extend_ttl(&nonce_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        let key = DataKey::Amendment(id);
+        env.storage().persistent().set(
+            &key,
+            &Amendment {
+                proposer: proposer.clone(),
+                new_amounts,
+                nonce,
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events()
+            .publish((symbol_short!("amend_p"), id), (proposer, nonce));
+        Ok(nonce)
+    }
+
+    /// The other party accepts the pending amendment by its `nonce`
+    /// (`SettlementMismatch` if none is pending or the nonce differs;
+    /// self-acceptance is `Unauthorized`). Applies the new amounts and total:
+    /// funds above the new total are refunded to the client (pro-rata to
+    /// funders); a larger total returns the escrow to `Created` until topped up.
+    /// Emits `("amended", id) -> (old_total, new_total, refunded)`.
+    pub fn accept_amendment(env: Env, id: u64, acceptor: Address, nonce: u32) -> Result<(), EscrowError> {
+        require_not_paused(&env, PAUSE_CREATE)?;
+        let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        acceptor.require_auth();
+        if acceptor != c.client && acceptor != c.freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+        let key = DataKey::Amendment(id);
+        let amendment: Amendment = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::SettlementMismatch)?;
+        if acceptor == amendment.proposer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if amendment.nonce != nonce {
+            return Err(EscrowError::SettlementMismatch);
+        }
+        if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        // Re-validate against the current state (releases may have happened).
+        let new_total = check_amendment(&env, &c, &amendment.new_amounts)?;
+        env.storage().persistent().remove(&key);
+        let old_total = c.total_amount;
+        for (i, amount) in amendment.new_amounts.iter().enumerate() {
+            let mut m = c.milestones.get(i as u32).unwrap();
+            m.amount = amount;
+            c.milestones.set(i as u32, m);
+        }
+        c.total_amount = new_total;
+        let mut refunded: i128 = 0;
+        if c.funded_amount > new_total {
+            refunded = c.funded_amount - new_total;
+            refund_funders(&env, &c, refunded)?;
+            c.funded_amount = new_total;
+            c.refunded_amount = c
+                .refunded_amount
+                .checked_add(refunded)
+                .ok_or(EscrowError::ArithmeticOverflow)?;
+            sub_liability(&env, &c.token, refunded)?;
+        }
+        if c.funded_amount < new_total {
+            if c.status == ContractStatus::Funded {
+                // Dedicated amendment reopen (outside the normal lifecycle
+                // machine): Funded -> Created until the top-up arrives.
+                c.status = ContractStatus::Created;
+            }
+            let fund_by = env
+                .ledger()
+                .timestamp()
+                .checked_add(FUNDING_WINDOW_SECS)
+                .ok_or(EscrowError::ArithmeticOverflow)?;
+            let fund_key = DataKey::FundBy(id);
+            env.storage().persistent().set(&fund_key, &fund_by);
+            env.storage()
+                .persistent()
+                .extend_ttl(&fund_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        } else if c.status == ContractStatus::Created {
+            transition(&mut c, ContractStatus::Funded)?;
+        }
+        if c.milestones.iter().all(|m| m.released) {
+            transition(&mut c, ContractStatus::Completed)?;
+            record_closed_at(&env, id);
+        }
+        clear_settlement(&env, id);
+        #[cfg(any(test, debug_assertions))]
+        {
+            check_invariants(&c);
+            assert_solvent(&env, &c.token);
+        }
+        save(&env, &c);
+        env.events()
+            .publish((symbol_short!("amended"), id), (old_total, new_total, refunded));
+        Ok(())
+    }
+
+    /// Pending amendment, if any.
+    pub fn get_amendment(env: Env, id: u64) -> Option<Amendment> {
+        env.storage().persistent().get(&DataKey::Amendment(id))
     }
 
     /// Returns a single milestone; `MilestoneNotFound` when out of range.

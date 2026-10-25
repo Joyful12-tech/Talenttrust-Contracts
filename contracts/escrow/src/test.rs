@@ -7389,3 +7389,165 @@ fn vesting_math_is_overflow_safe() {
     assert_eq!(vested_at(&env, amount, 0, u64::MAX, u64::MAX), amount);
     assert_eq!(vested_at(&env, amount, 5, 10, 0), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Mutual milestone amendments
+// ---------------------------------------------------------------------------
+
+fn assert_amendment_invariants(s: &Setup, id: u64) {
+    let c = s.escrow.get_contract(&id);
+    assert!(c.funded_amount <= c.total_amount);
+    assert_eq!(
+        s.token.balance(&s.escrow.address),
+        c.funded_amount - c.released_amount
+    );
+    check_invariants(&c);
+}
+
+#[test]
+fn amendment_decrease_refunds_excess() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 50 * U],
+    );
+    s.escrow.deposit_funds(&id, &(150 * U));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+    let nonce = s
+        .escrow
+        .propose_amendment(&id, &s.client, &vec![&s.env, 50 * U, 50 * U]);
+    s.escrow.accept_amendment(&id, &s.freelancer, &nonce);
+    let ev = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.escrow.address)
+        .last()
+        .unwrap();
+    assert_eq!(
+        <(i128, i128, i128)>::try_from_val(&s.env, &ev.2).unwrap(),
+        (150 * U, 100 * U, 50 * U)
+    );
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.total_amount, 100 * U);
+    assert_eq!(c.funded_amount, 100 * U);
+    assert_eq!(c.status, ContractStatus::Funded);
+    assert_eq!(s.token.balance(&s.client), 900 * U);
+    assert_amendment_invariants(&s, id);
+    assert_eq!(s.escrow.get_amendment(&id), None);
+}
+
+#[test]
+fn amendment_increase_flips_to_created_and_requires_deposit() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50 * U],
+    );
+    s.escrow.deposit_funds(&id, &(50 * U));
+    let nonce = s
+        .escrow
+        .propose_amendment(&id, &s.client, &vec![&s.env, 100 * U]);
+    s.escrow.accept_amendment(&id, &s.freelancer, &nonce);
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Created);
+    assert_eq!(c.total_amount, 100 * U);
+    assert_eq!(c.funded_amount, 50 * U);
+    assert_amendment_invariants(&s, id);
+    s.escrow.deposit_funds(&id, &(50 * U));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    assert_eq!(
+        s.escrow.get_contract(&id).status,
+        ContractStatus::Completed
+    );
+}
+
+#[test]
+fn amendment_released_milestone_amount_change_rejected() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50 * U, 50 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(
+        s.escrow
+            .try_propose_amendment(&id, &s.client, &vec![&s.env, 40 * U, 50 * U]),
+        Err(Ok(EscrowError::MilestoneAlreadyReleased))
+    );
+    // Changing only the unreleased milestone is fine.
+    let nonce = s
+        .escrow
+        .propose_amendment(&id, &s.freelancer, &vec![&s.env, 50 * U, 30 * U]);
+    s.escrow.accept_amendment(&id, &s.client, &nonce);
+    assert_eq!(s.escrow.get_contract(&id).total_amount, 80 * U);
+    assert_amendment_invariants(&s, id);
+    assert_eq!(
+        s.escrow
+            .try_propose_amendment(&id, &s.client, &vec![&s.env, 50 * U]),
+        Err(Ok(EscrowError::InvalidMilestones))
+    );
+}
+
+#[test]
+fn amendment_self_accept_rejected() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50 * U, 50 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    let nonce = s
+        .escrow
+        .propose_amendment(&id, &s.client, &vec![&s.env, 40 * U, 60 * U]);
+    assert_eq!(
+        s.escrow.try_accept_amendment(&id, &s.client, &nonce),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+}
+
+#[test]
+fn amendment_stale_nonce_rejected() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50 * U, 50 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    let first = s
+        .escrow
+        .propose_amendment(&id, &s.client, &vec![&s.env, 40 * U, 60 * U]);
+    assert_eq!(
+        s.escrow.try_accept_amendment(&id, &s.freelancer, &(first + 1)),
+        Err(Ok(EscrowError::SettlementMismatch))
+    );
+    // A newer proposal makes the first nonce stale.
+    let second = s
+        .escrow
+        .propose_amendment(&id, &s.client, &vec![&s.env, 30 * U, 70 * U]);
+    assert_eq!(second, first + 1);
+    assert_eq!(
+        s.escrow.try_accept_amendment(&id, &s.freelancer, &first),
+        Err(Ok(EscrowError::SettlementMismatch))
+    );
+    s.escrow.accept_amendment(&id, &s.freelancer, &second);
+    assert_eq!(
+        s.escrow.get_contract(&id).milestones.get(1).unwrap().amount,
+        70 * U
+    );
+    assert_amendment_invariants(&s, id);
+}
