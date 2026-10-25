@@ -114,6 +114,15 @@ Resolved jobs allow reputation rating; dispute outcomes and cancellation metrics
 
 Bonuses are allowed while an escrow is `Funded` or `Completed`; they do not change the escrow status or accounting.
 
+### Storage TTL policy
+
+Persistent entries are extended to `PERSISTENT_TTL_EXTEND` (~30 days of ledgers) whenever they are written and their TTL is below `PERSISTENT_TTL_THRESHOLD` (~1 day). Every mutating entry point also bumps the contract instance (admin, counters, flags), so normal activity on any escrow keeps the instance alive. Reads never extend TTLs. Anyone can pay to keep quiet state alive:
+
+| Function | Auth | Description |
+| --- | --- | --- |
+| `extend_escrow_ttl(id)` | anyone | Extend an escrow entry (or its receipt) and all of its existing side entries; `ContractNotFound` if missing |
+| `extend_reputation_ttl(addr)` | anyone | Extend an address's reputation, weighted reputation, client reputation, outcomes and bonus totals |
+
 ### Arithmetic
 
 All amount, id and counter arithmetic is checked and fails with `ArithmeticOverflow` (`17`) instead of panicking. Basis-point splits use the overflow-free `mul_bps(amount, bps) = (amount / D) * bps + ((amount % D) * bps) / D` (`D = 10_000`), which equals `floor(amount * bps / D)` for any `amount`.

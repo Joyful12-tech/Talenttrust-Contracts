@@ -462,6 +462,8 @@ fn admin(env: &Env) -> Result<Address, EscrowError> {
 fn require_admin(env: &Env) -> Result<Address, EscrowError> {
     let a = admin(env)?;
     a.require_auth();
+    // Every admin entry point keeps the instance (Admin, NextId, flags) alive.
+    bump_instance(env);
     Ok(a)
 }
 
@@ -535,6 +537,8 @@ fn require_not_paused(env: &Env, op: u32) -> Result<(), EscrowError> {
     if pause_flags(env) & op != 0 {
         return Err(EscrowError::Paused);
     }
+    // Every gated (mutating) entry point keeps the instance alive.
+    bump_instance(env);
     Ok(())
 }
 
@@ -617,6 +621,19 @@ fn save(env: &Env, c: &EscrowContract) {
     let legacy = DataKey::Contract(c.id);
     if env.storage().persistent().has(&legacy) {
         env.storage().persistent().remove(&legacy);
+    }
+    bump_instance(env);
+}
+
+/// Extends a persistent entry's TTL if it exists.
+fn extend_if_present(env: &Env, key: &DataKey) -> bool {
+    if env.storage().persistent().has(key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        true
+    } else {
+        false
     }
 }
 
@@ -2472,6 +2489,7 @@ impl Escrow {
         freelancer_bps: u32,
     ) -> Result<(), EscrowError> {
         member.require_auth();
+        bump_instance(&env);
         let c = load(&env, id)?;
         if c.status != ContractStatus::Disputed {
             return Err(EscrowError::InvalidStatus);
@@ -2643,6 +2661,7 @@ impl Escrow {
     pub fn reject_change_order(env: Env, id: u64) -> Result<(), EscrowError> {
         let c = load(&env, id)?;
         c.freelancer.require_auth();
+        bump_instance(&env);
         let key = DataKey::ChangeOrder(id);
         if !env.storage().persistent().has(&key) {
             return Err(EscrowError::ChangeOrderNotFound);
@@ -2912,6 +2931,7 @@ impl Escrow {
     pub fn withdraw_settlement(env: Env, id: u64, proposer: Address) -> Result<(), EscrowError> {
         load(&env, id)?;
         proposer.require_auth();
+        bump_instance(&env);
         let key = DataKey::Settlement(id);
         let proposal: SettlementProposal = env
             .storage()
@@ -3233,6 +3253,7 @@ impl Escrow {
         if ids.len() > MAX_MIGRATE_BATCH {
             return Err(EscrowError::InvalidAmount);
         }
+        bump_instance(&env);
         let mut migrated: u32 = 0;
         for id in ids.iter() {
             if env.storage().persistent().has(&DataKey::ContractV(id)) {
@@ -3250,6 +3271,69 @@ impl Escrow {
                 .publish((symbol_short!("migrated"),), migrated);
         }
         Ok(migrated)
+    }
+
+    /// Permissionless keep-alive: extends the escrow entry (versioned or legacy
+    /// key, or its receipt once compacted) and every per-escrow side entry that
+    /// exists to `PERSISTENT_TTL_EXTEND`. The caller pays the rent extension.
+    /// `ContractNotFound` if the escrow does not exist.
+    pub fn extend_escrow_ttl(env: Env, id: u64) -> Result<(), EscrowError> {
+        let mut found = extend_if_present(&env, &DataKey::ContractV(id));
+        found |= extend_if_present(&env, &DataKey::Contract(id));
+        found |= extend_if_present(&env, &DataKey::Receipt(id));
+        if !found {
+            return Err(EscrowError::ContractNotFound);
+        }
+        let keys = [
+            DataKey::FundBy(id),
+            DataKey::Funders(id),
+            DataKey::Frozen(id),
+            DataKey::Payout(id),
+            DataKey::Team(id),
+            DataKey::ClosedAt(id),
+            DataKey::Sequential(id),
+            DataKey::Terms(id),
+            DataKey::MilestoneSpecs(id),
+            DataKey::DisputeBond(id),
+            DataKey::Settlement(id),
+            DataKey::ReviewWindow(id),
+            DataKey::EscrowFee(id),
+            DataKey::Bonus(id),
+            DataKey::Votes(id),
+            DataKey::ChangeOrder(id),
+            DataKey::Resigned(id),
+            DataKey::Rating(id),
+            DataKey::RatingWeight(id),
+            DataKey::ClientRated(id),
+        ];
+        for key in keys.iter() {
+            extend_if_present(&env, key);
+        }
+        if let Ok(c) = load(&env, id) {
+            for i in 0..c.milestones.len() {
+                extend_if_present(&env, &DataKey::Submitted(id, i));
+                extend_if_present(&env, &DataKey::Delivery(id, i));
+                extend_if_present(&env, &DataKey::MilestonePaid(id, i));
+            }
+        }
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Permissionless keep-alive for an address's reputation entries
+    /// (freelancer, weighted, client and outcome records, bonus totals).
+    pub fn extend_reputation_ttl(env: Env, freelancer: Address) {
+        let keys = [
+            DataKey::Reputation(freelancer.clone()),
+            DataKey::WeightedRep(freelancer.clone()),
+            DataKey::ClientReputation(freelancer.clone()),
+            DataKey::Outcomes(freelancer.clone()),
+            DataKey::BonusTotal(freelancer),
+        ];
+        for key in keys.iter() {
+            extend_if_present(&env, key);
+        }
+        bump_instance(&env);
     }
 
     /// Returns a single milestone; `MilestoneNotFound` when out of range.
@@ -3293,6 +3377,7 @@ impl Escrow {
         }
         let c = load(&env, id)?;
         require_not_frozen(&env, id)?;
+        bump_instance(&env);
         let now = u64::from(env.ledger().sequence());
         let closed_at: Option<u64> = env.storage().persistent().get(&DataKey::ClosedAt(id));
         match c.status {

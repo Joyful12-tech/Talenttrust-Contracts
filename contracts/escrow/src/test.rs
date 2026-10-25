@@ -6939,3 +6939,123 @@ fn batch_release_charges_exact_per_milestone_fees() {
     assert_eq!(s.token.balance(&s.freelancer), 300 * U - fee);
     assert_eq!(s.token.balance(&s.escrow.address), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Explicit storage TTL management
+//
+// TTLs are measured in ledgers. Entries written at sequence 0 live until
+// `PERSISTENT_TTL_EXTEND`; jumping the ledger close to that (but before it)
+// simulates a long quiet period, after which only bumped entries survive.
+// ---------------------------------------------------------------------------
+
+fn instance_ttl(s: &Setup) -> u32 {
+    use soroban_sdk::testutils::storage::Instance as _;
+    s.env
+        .as_contract(&s.escrow.address, || s.env.storage().instance().get_ttl())
+}
+
+fn escrow_ttl(s: &Setup, id: u64) -> u32 {
+    persistent_ttl(s, &DataKey::ContractV(id))
+}
+
+/// A sequence where every entry written at sequence 0 is still live but below
+/// the extension threshold.
+const QUIET: u32 = PERSISTENT_TTL_EXTEND - PERSISTENT_TTL_THRESHOLD / 2;
+
+#[test]
+fn mutating_entry_points_keep_instance_alive() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.env.ledger().set_sequence_number(QUIET);
+    assert!(instance_ttl(&s) < PERSISTENT_TTL_THRESHOLD);
+    // A non-creating mutation (no new escrow) must bump the instance.
+    s.escrow.set_terms(&id, &BytesN::from_array(&s.env, &[1u8; 32]), &Vec::new(&s.env));
+    assert!(instance_ttl(&s) >= PERSISTENT_TTL_THRESHOLD);
+
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.env.ledger().set_sequence_number(QUIET);
+    s.escrow.freeze_escrow(&id, &symbol_short!("check"));
+    assert!(instance_ttl(&s) >= PERSISTENT_TTL_THRESHOLD);
+
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.env.ledger().set_sequence_number(QUIET);
+    s.escrow.propose_settlement(&id, &s.client, &0);
+    assert!(instance_ttl(&s) >= PERSISTENT_TTL_THRESHOLD);
+}
+
+#[test]
+fn extend_escrow_ttl_keeps_quiet_escrow_and_side_keys_alive() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(40 * U));
+    s.env.ledger().set_sequence_number(QUIET);
+    let before = escrow_ttl(&s, id);
+    assert!(before < PERSISTENT_TTL_THRESHOLD);
+    // Reads stay read-only.
+    let _ = s.escrow.get_contract(&id);
+    assert_eq!(escrow_ttl(&s, id), before);
+
+    s.escrow.extend_escrow_ttl(&id);
+    assert!(escrow_ttl(&s, id) >= PERSISTENT_TTL_THRESHOLD);
+    assert!(persistent_ttl(&s, &DataKey::FundBy(id)) >= PERSISTENT_TTL_THRESHOLD);
+    assert!(persistent_ttl(&s, &DataKey::Funders(id)) >= PERSISTENT_TTL_THRESHOLD);
+    assert!(instance_ttl(&s) >= PERSISTENT_TTL_THRESHOLD);
+
+    // Past the original expiry the escrow is still reachable.
+    s.env
+        .ledger()
+        .set_sequence_number(PERSISTENT_TTL_EXTEND + PERSISTENT_TTL_THRESHOLD);
+    assert_eq!(s.escrow.get_contract(&id).funded_amount, 40 * U);
+    assert_eq!(
+        s.escrow.try_extend_escrow_ttl(&999),
+        Err(Ok(EscrowError::ContractNotFound))
+    );
+}
+
+#[test]
+fn extend_reputation_ttl_keeps_reputation_alive() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.release_milestone(&id, &0);
+    s.escrow.issue_reputation(&id, &5);
+    s.env.ledger().set_sequence_number(QUIET);
+    let key = DataKey::Reputation(s.freelancer.clone());
+    let before = persistent_ttl(&s, &key);
+    assert!(before < PERSISTENT_TTL_THRESHOLD);
+    let _ = s.escrow.get_reputation(&s.freelancer);
+    assert_eq!(persistent_ttl(&s, &key), before);
+    s.escrow.extend_reputation_ttl(&s.freelancer);
+    assert!(persistent_ttl(&s, &key) >= PERSISTENT_TTL_THRESHOLD);
+    assert!(
+        persistent_ttl(&s, &DataKey::WeightedRep(s.freelancer.clone()))
+            >= PERSISTENT_TTL_THRESHOLD
+    );
+}
