@@ -6604,3 +6604,190 @@ fn settlement_invalidated_by_deposit_and_events_emitted() {
         Err(Ok(EscrowError::Unauthorized))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Granular pause flags
+// ---------------------------------------------------------------------------
+
+#[test]
+fn paused_contract_blocks_issue_reputation() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.release_milestone(&id, &0);
+    s.escrow.set_paused(&s.admin, &true);
+    assert_eq!(s.escrow.get_pause_flags(), PAUSE_ALL);
+    assert_eq!(
+        s.escrow.try_issue_reputation(&id, &5),
+        Err(Ok(EscrowError::Paused))
+    );
+    s.escrow.set_paused(&s.admin, &false);
+    assert_eq!(s.escrow.get_pause_flags(), 0);
+    s.escrow.issue_reputation(&id, &5);
+}
+
+/// Prepared escrows for one representative call per pause category.
+struct PauseFixture {
+    created: u64,
+    funded: u64,
+    disputable: u64,
+    cancellable: u64,
+    completed: u64,
+}
+
+fn pause_fixture(s: &Setup) -> PauseFixture {
+    let mk = |amount: i128| {
+        s.escrow.create_contract(
+            &s.client,
+            &s.freelancer,
+            &s.token.address,
+            &vec![&s.env, amount],
+        )
+    };
+    let created = mk(10 * U);
+    let funded = mk(10 * U);
+    s.escrow.deposit_funds(&funded, &(10 * U));
+    let disputable = mk(10 * U);
+    s.escrow.deposit_funds(&disputable, &(10 * U));
+    let cancellable = mk(10 * U);
+    s.escrow.deposit_funds(&cancellable, &(10 * U));
+    let completed = mk(10 * U);
+    s.escrow.deposit_funds(&completed, &(10 * U));
+    s.escrow.release_milestone(&completed, &0);
+    PauseFixture {
+        created,
+        funded,
+        disputable,
+        cancellable,
+        completed,
+    }
+}
+
+#[test]
+fn each_pause_flag_gates_exactly_its_entry_points() {
+    let flags = [
+        PAUSE_CREATE,
+        PAUSE_DEPOSIT,
+        PAUSE_RELEASE,
+        PAUSE_DISPUTE,
+        PAUSE_CANCEL,
+        PAUSE_REPUTATION,
+    ];
+    for flag in flags.iter() {
+        let s = setup();
+        let f = pause_fixture(&s);
+        s.escrow.set_pause_flags(&s.admin, flag);
+        assert!(s.escrow.is_paused());
+        let paused = |r: bool, op: u32| {
+            if *flag == op {
+                assert!(r, "flag {} must block its category", flag);
+            } else {
+                assert!(!r, "flag {} must not block category {}", flag, op);
+            }
+        };
+        let r = s.escrow.try_create_contract(
+            &s.client,
+            &s.freelancer,
+            &s.token.address,
+            &vec![&s.env, 10 * U],
+        );
+        paused(r == Err(Ok(EscrowError::Paused)), PAUSE_CREATE);
+        let r = s.escrow.try_deposit_funds(&f.created, &(10 * U));
+        paused(r == Err(Ok(EscrowError::Paused)), PAUSE_DEPOSIT);
+        let r = s.escrow.try_release_milestone(&f.funded, &0);
+        paused(r == Err(Ok(EscrowError::Paused)), PAUSE_RELEASE);
+        let r = s.escrow.try_open_dispute(&f.disputable, &s.client);
+        paused(r == Err(Ok(EscrowError::Paused)), PAUSE_DISPUTE);
+        let r = s.escrow.try_cancel_contract(&f.cancellable);
+        paused(r == Err(Ok(EscrowError::Paused)), PAUSE_CANCEL);
+        let r = s.escrow.try_issue_reputation(&f.completed, &4);
+        paused(r == Err(Ok(EscrowError::Paused)), PAUSE_REPUTATION);
+    }
+}
+
+#[test]
+fn inflow_pause_still_lets_clients_cancel_and_refund() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(60 * U));
+    s.escrow
+        .set_pause_flags(&s.admin, &(PAUSE_CREATE | PAUSE_DEPOSIT));
+    assert_eq!(
+        s.escrow.try_deposit_funds(&id, &(40 * U)),
+        Err(Ok(EscrowError::Paused))
+    );
+    assert_eq!(
+        s.escrow.try_create_and_fund(
+            &s.client,
+            &s.freelancer,
+            &s.token.address,
+            &vec![&s.env, 10 * U]
+        ),
+        Err(Ok(EscrowError::Paused))
+    );
+    s.escrow.cancel_contract(&id);
+    assert_eq!(s.token.balance(&s.client), 1_000 * U);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+}
+
+#[test]
+fn invalid_pause_bits_rejected_and_only_pausers_set_flags() {
+    let s = setup();
+    assert_eq!(
+        s.escrow.try_set_pause_flags(&s.admin, &(PAUSE_ALL + 1)),
+        Err(Ok(EscrowError::InvalidAmount))
+    );
+    let outsider = Address::generate(&s.env);
+    assert_eq!(
+        s.escrow.try_set_pause_flags(&outsider, &PAUSE_CREATE),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+    let pauser = Address::generate(&s.env);
+    s.escrow.grant_role(&Role::Pauser, &pauser);
+    s.escrow.set_pause_flags(&pauser, &PAUSE_RELEASE);
+    // Events are per invocation: inspect them before the next call.
+    let ev = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.escrow.address)
+        .last()
+        .unwrap();
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &ev.1.get(0).unwrap()).unwrap(),
+        symbol_short!("pause")
+    );
+    assert_eq!(u32::try_from_val(&s.env, &ev.2).unwrap(), PAUSE_RELEASE);
+    assert_eq!(s.escrow.get_pause_flags(), PAUSE_RELEASE);
+}
+
+#[test]
+fn legacy_paused_flag_means_pause_all() {
+    let s = setup();
+    s.env.as_contract(&s.escrow.address, || {
+        s.env.storage().instance().remove(&DataKey::PauseFlags);
+        s.env.storage().instance().set(&DataKey::Paused, &true);
+    });
+    assert!(s.escrow.is_paused());
+    assert_eq!(s.escrow.get_pause_flags(), PAUSE_ALL);
+    assert_eq!(
+        s.escrow.try_create_contract(
+            &s.client,
+            &s.freelancer,
+            &s.token.address,
+            &vec![&s.env, 10 * U]
+        ),
+        Err(Ok(EscrowError::Paused))
+    );
+}

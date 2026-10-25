@@ -32,6 +32,14 @@ pub const MAX_MIGRATE_BATCH: u32 = 50;
 pub const BPS_DENOMINATOR: i128 = 10_000;
 /// 48-hour time-lock delay before a scheduled WASM upgrade can be executed.
 pub const UPGRADE_DELAY_SECS: u64 = 172_800;
+/// Pause categories (bitmask) for `set_pause_flags`.
+pub const PAUSE_CREATE: u32 = 1;
+pub const PAUSE_DEPOSIT: u32 = 2;
+pub const PAUSE_RELEASE: u32 = 4;
+pub const PAUSE_DISPUTE: u32 = 8;
+pub const PAUSE_CANCEL: u32 = 16;
+pub const PAUSE_REPUTATION: u32 = 32;
+pub const PAUSE_ALL: u32 = 63;
 /// Minimum continuous pause before either party can force an emergency exit (30 days).
 pub const EMERGENCY_EXIT_DELAY_SECS: u64 = 30 * 86_400;
 /// Minimum review window after a milestone submission: 1 hour.
@@ -429,6 +437,7 @@ enum DataKey {
     PausedAt,
     Resigned(u64),
     Settlement(u64),
+    PauseFlags,
 }
 
 #[contract]
@@ -479,13 +488,42 @@ fn set_role(env: &Env, role: Role, account: Address, member: bool) -> Result<(),
     Ok(())
 }
 
-fn require_not_paused(env: &Env) -> Result<(), EscrowError> {
+/// Current pause bitmask. Backwards compatible: with no stored flags, a
+/// legacy `Paused == true` means `PAUSE_ALL`.
+fn pause_flags(env: &Env) -> u32 {
+    if let Some(flags) = env.storage().instance().get::<_, u32>(&DataKey::PauseFlags) {
+        return flags;
+    }
     if env
         .storage()
         .instance()
         .get::<_, bool>(&DataKey::Paused)
         .unwrap_or(false)
     {
+        PAUSE_ALL
+    } else {
+        0
+    }
+}
+
+/// Stores the pause bitmask (and the legacy boolean), starting the
+/// emergency-exit clock on unpaused -> paused and clearing it on full unpause.
+fn write_pause_flags(env: &Env, flags: u32) {
+    let was_paused = pause_flags(env) != 0;
+    env.storage().instance().set(&DataKey::PauseFlags, &flags);
+    env.storage().instance().set(&DataKey::Paused, &(flags != 0));
+    if flags != 0 && !was_paused {
+        env.storage()
+            .instance()
+            .set(&DataKey::PausedAt, &env.ledger().timestamp());
+    } else if flags == 0 {
+        env.storage().instance().remove(&DataKey::PausedAt);
+    }
+}
+
+/// Fails with `Paused` when the operation category `op` is paused.
+fn require_not_paused(env: &Env, op: u32) -> Result<(), EscrowError> {
+    if pause_flags(env) & op != 0 {
         return Err(EscrowError::Paused);
     }
     Ok(())
@@ -759,7 +797,7 @@ fn build_escrow(
     review_window_secs: u64,
 ) -> Result<u64, EscrowError> {
     let admin_addr = admin(&env)?;
-    require_not_paused(&env)?;
+    require_not_paused(&env, PAUSE_CREATE)?;
     client.require_auth();
 
     // Validation order: parties -> milestones -> amounts.
@@ -829,6 +867,7 @@ fn build_escrow(
         reputation_issued: false,
     };
     if fund_now {
+        require_not_paused(&env, PAUSE_DEPOSIT)?;
         transfer_checked(&env, &c.token, &client, &contract_addr, total)?;
         let mut funders: Map<Address, i128> = Map::new(&env);
         funders.set(client.clone(), total);
@@ -1373,23 +1412,36 @@ impl Escrow {
         if !holds_role(&env, Role::Pauser, &caller) {
             return Err(EscrowError::Unauthorized);
         }
-        let was_paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false);
-        env.storage().instance().set(&DataKey::Paused, &paused);
+        // `true` pauses every category (`PAUSE_ALL`), `false` clears all flags.
         // The emergency-exit clock starts on unpaused -> paused and resets on unpause.
-        if paused && !was_paused {
-            env.storage()
-                .instance()
-                .set(&DataKey::PausedAt, &env.ledger().timestamp());
-        } else if !paused {
-            env.storage().instance().remove(&DataKey::PausedAt);
-        }
+        write_pause_flags(&env, if paused { PAUSE_ALL } else { 0 });
         bump_instance(&env);
         events::paused(&env, paused);
         Ok(())
+    }
+
+    /// Granular circuit breaker: pause only the given operation categories
+    /// (`PAUSE_CREATE | PAUSE_DEPOSIT | PAUSE_RELEASE | PAUSE_DISPUTE |
+    /// PAUSE_CANCEL | PAUSE_REPUTATION`), e.g. stop new inflows while users can
+    /// still exit. Caller must be the admin or hold `Pauser`; bits outside
+    /// `PAUSE_ALL` return `InvalidAmount`. Emits `("pause",) -> flags`.
+    pub fn set_pause_flags(env: Env, caller: Address, flags: u32) -> Result<(), EscrowError> {
+        caller.require_auth();
+        if !holds_role(&env, Role::Pauser, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if flags & !PAUSE_ALL != 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        write_pause_flags(&env, flags);
+        bump_instance(&env);
+        env.events().publish((symbol_short!("pause"),), flags);
+        Ok(())
+    }
+
+    /// Current pause bitmask (`0` when nothing is paused).
+    pub fn get_pause_flags(env: Env) -> u32 {
+        pause_flags(&env)
     }
 
     /// Ledger timestamp at which the current pause began, if paused.
@@ -1488,11 +1540,9 @@ impl Escrow {
         Ok(())
     }
 
+    /// `true` iff any pause category is set (see `get_pause_flags`).
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+        pause_flags(&env) != 0
     }
 
     /// Returns the active per-token liability counter.
@@ -1526,7 +1576,7 @@ impl Escrow {
     /// `InvalidStatus` while a dispute is open. `payout` must not be the
     /// contract address or the client (`InvalidParties`).
     pub fn set_payout_address(env: Env, id: u64, payout: Address) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CREATE)?;
         let c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.freelancer.require_auth();
@@ -1688,7 +1738,7 @@ impl Escrow {
         id: u64,
         payees: Vec<(Address, u32)>,
     ) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CREATE)?;
         let c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.freelancer.require_auth();
@@ -1735,7 +1785,7 @@ impl Escrow {
 
     /// Client deposits `amount` of the escrow token into the contract.
     pub fn deposit_funds(env: Env, id: u64, amount: i128) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_DEPOSIT)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         let client = c.client.clone();
@@ -1746,7 +1796,7 @@ impl Escrow {
     /// the escrow token from `funder`. Contributions are tracked per funder and
     /// refunds are routed back pro-rata to the actual funders.
     pub fn deposit_from(env: Env, id: u64, funder: Address, amount: i128) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_DEPOSIT)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         apply_deposit(&env, &mut c, &funder, amount)
@@ -1765,7 +1815,7 @@ impl Escrow {
     /// amount covered by `funded - released - (already submitted backing)`.
     /// Emits `("submit", id) -> (index, submitted_at)`.
     pub fn submit_milestone(env: Env, id: u64, index: u32) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_RELEASE)?;
         let c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.freelancer.require_auth();
@@ -1804,7 +1854,7 @@ impl Escrow {
     /// escrow is `Disputed`; still available after the client cancelled, since
     /// submitted funds are kept in escrow. Emits `("claim", id) -> (index, amount)`.
     pub fn claim_milestone(env: Env, id: u64, index: u32) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_RELEASE)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.freelancer.require_auth();
@@ -1891,7 +1941,7 @@ impl Escrow {
     /// Client approves a milestone and the freelancer is paid (accepts both
     /// `Pending` and `Submitted` milestones).
     pub fn release_milestone(env: Env, id: u64, index: u32) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_RELEASE)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.client.require_auth();
@@ -1947,7 +1997,7 @@ impl Escrow {
     /// milestone amount the milestone is released and completion is checked.
     /// Emits `("rel_part", id) -> (index, amount, remaining)`.
     pub fn release_partial(env: Env, id: u64, index: u32, amount: i128) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_RELEASE)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.client.require_auth();
@@ -2025,7 +2075,7 @@ impl Escrow {
     /// validated first (all-or-nothing), the summed amount is paid out once and
     /// the escrow is saved once. Returns the total paid.
     pub fn release_milestones(env: Env, id: u64, indices: Vec<u32>) -> Result<i128, EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_RELEASE)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.client.require_auth();
@@ -2130,7 +2180,7 @@ impl Escrow {
     /// contract's held balance, so it cannot affect escrow accounting or a
     /// dispute split. Allowed on Funded or Completed escrows.
     pub fn pay_bonus(env: Env, id: u64, amount: i128) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_RELEASE)?;
         let c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.client.require_auth();
@@ -2193,7 +2243,7 @@ impl Escrow {
 
     /// Either party may raise a dispute, freezing releases until the admin resolves it.
     pub fn open_dispute(env: Env, id: u64, caller: Address) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_DISPUTE)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         caller.require_auth();
@@ -2390,7 +2440,7 @@ impl Escrow {
     /// `Completed` escrow. `existing + new <= MAX_MILESTONES`, each amount
     /// >= `MIN_MILESTONE_AMOUNT`. Replaces any pending proposal.
     pub fn propose_change_order(env: Env, id: u64, amounts: Vec<i128>) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CREATE)?;
         let c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.client.require_auth();
@@ -2428,7 +2478,7 @@ impl Escrow {
     /// `Completed`. A reputation already issued for the escrow stays issued, so
     /// `issue_reputation` remains blocked for it. Returns `(added_count, added_total)`.
     pub fn accept_change_order(env: Env, id: u64) -> Result<(u32, i128), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CREATE)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.freelancer.require_auth();
@@ -2515,7 +2565,7 @@ impl Escrow {
         terms_hash: BytesN<32>,
         milestone_hashes: Vec<BytesN<32>>,
     ) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CREATE)?;
         let c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.client.require_auth();
@@ -2549,7 +2599,7 @@ impl Escrow {
         index: u32,
         delivery_hash: BytesN<32>,
     ) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_RELEASE)?;
         let c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.freelancer.require_auth();
@@ -2597,7 +2647,7 @@ impl Escrow {
     /// refunded to its funders (the client unless sponsors contributed) and the
     /// escrow is `Cancelled`. Emits `("expired", id) -> refund`.
     pub fn expire_unfunded(env: Env, id: u64) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CANCEL)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         if c.status != ContractStatus::Created || c.released_amount != 0 {
@@ -2644,7 +2694,7 @@ impl Escrow {
         proposer: Address,
         freelancer_amount: i128,
     ) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CANCEL)?;
         let c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         proposer.require_auth();
@@ -2693,7 +2743,7 @@ impl Escrow {
         acceptor: Address,
         freelancer_amount: i128,
     ) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CANCEL)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         acceptor.require_auth();
@@ -2784,7 +2834,7 @@ impl Escrow {
     /// milestones stay paid, and the escrow is `Cancelled`. Recorded separately
     /// from client cancellations (`was_resigned`). Emits `("resign", id) -> refunded`.
     pub fn resign(env: Env, id: u64) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CANCEL)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.freelancer.require_auth();
@@ -2826,7 +2876,7 @@ impl Escrow {
     /// escrow, claimable via `claim_milestone` once the review window elapses.
     /// If any funds were held and refunded, cancellations is incremented for the client.
     pub fn cancel_contract(env: Env, id: u64) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CANCEL)?;
         let mut c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.client.require_auth();
@@ -2881,6 +2931,7 @@ impl Escrow {
         // A compacted escrow keeps only an immutable receipt. Compaction of an
         // unrated escrow is blocked until the 30-day grace period has passed,
         // so it cannot be used to block a rating.
+        require_not_paused(&env, PAUSE_REPUTATION)?;
         if is_compacted(&env, id) {
             return Err(EscrowError::EscrowCompacted);
         }
@@ -2961,7 +3012,7 @@ impl Escrow {
 
     /// After completion or resolution the freelancer may rate the client (1..=5) once per contract.
     pub fn rate_client(env: Env, id: u64, rating: u32) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_REPUTATION)?;
         let c = load(&env, id)?;
         require_not_frozen(&env, id)?;
         c.freelancer.require_auth();
@@ -3006,7 +3057,7 @@ impl Escrow {
     /// Governance can void fraudulent ratings, reversing their effect and recording an audit trail.
     pub fn void_rating(env: Env, id: u64, reason: Symbol) -> Result<(), EscrowError> {
         require_admin(&env)?;
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_REPUTATION)?;
 
         let rating_key = DataKey::Rating(id);
         let mut record: RatingRecord = env
