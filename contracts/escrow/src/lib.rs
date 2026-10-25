@@ -40,6 +40,8 @@ pub const PAUSE_DISPUTE: u32 = 8;
 pub const PAUSE_CANCEL: u32 = 16;
 pub const PAUSE_REPUTATION: u32 = 32;
 pub const PAUSE_ALL: u32 = 63;
+/// Maximum protocol fee: 500 bps (5%).
+pub const MAX_FEE_BPS: u32 = 500;
 /// Minimum continuous pause before either party can force an emergency exit (30 days).
 pub const EMERGENCY_EXIT_DELAY_SECS: u64 = 30 * 86_400;
 /// Minimum review window after a milestone submission: 1 hour.
@@ -138,6 +140,7 @@ pub enum EscrowError {
     NoPendingAdmin = 46,
     EmergencyExitNotAvailable = 47,
     SettlementMismatch = 48,
+    FeeTooHigh = 49,
 }
 
 #[contracttype]
@@ -288,6 +291,8 @@ pub struct ReleaseEvent {
     pub to: Address,
     pub released_amount: i128,
     pub status: ContractStatus,
+    /// Protocol fee deducted from `amount` (sent to the treasury).
+    pub fee: i128,
 }
 
 /// `(1, "dispute", id)` — a party opened a dispute.
@@ -438,6 +443,10 @@ enum DataKey {
     Resigned(u64),
     Settlement(u64),
     PauseFlags,
+    FeeBps,
+    Treasury,
+    /// Fee rate (bps) snapshotted for an escrow at creation.
+    EscrowFee(u64),
 }
 
 #[contract]
@@ -774,14 +783,57 @@ fn distribute(
 
 /// Pays a freelancer-side `amount` to the configured team split, or to the
 /// freelancer's payout address (see `payee`) when no split is configured.
-fn pay_out(env: &Env, c: &EscrowContract, amount: i128) -> Result<(), EscrowError> {
+///
+/// The escrow's snapshotted protocol fee (`get_escrow_fee`) is deducted first
+/// (rounded down) and sent to the treasury; the net goes to the freelancer
+/// side. Returns the fee charged.
+fn pay_out(env: &Env, c: &EscrowContract, amount: i128) -> Result<i128, EscrowError> {
+    let fee = fee_for(env, c, amount);
+    pay_out_with_fee(env, c, amount, fee)?;
+    Ok(fee)
+}
+
+/// Protocol fee due on a freelancer-side payout of `amount` for escrow `c`
+/// (0 without a snapshotted rate or a configured treasury).
+fn fee_for(env: &Env, c: &EscrowContract, amount: i128) -> i128 {
+    let bps = escrow_fee(env, c.id);
+    if amount <= 0 || bps == 0 || !env.storage().instance().has(&DataKey::Treasury) {
+        return 0;
+    }
+    mul_bps(amount, bps)
+}
+
+/// Sends `fee` to the treasury and `amount - fee` to the freelancer side.
+fn pay_out_with_fee(env: &Env, c: &EscrowContract, amount: i128, fee: i128) -> Result<(), EscrowError> {
+    if amount <= 0 {
+        return Ok(());
+    }
+    let this = env.current_contract_address();
+    if fee > 0 {
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(EscrowError::NotInitialized)?;
+        transfer_checked(env, &c.token, &this, &treasury, fee)?;
+    }
+    let net = amount
+        .checked_sub(fee)
+        .ok_or(EscrowError::ArithmeticOverflow)?;
     let payees = team_split(env, c.id);
     if payees.is_empty() {
-        let this = env.current_contract_address();
-        transfer_checked(env, &c.token, &this, &payee(env, c), amount)
+        transfer_checked(env, &c.token, &this, &payee(env, c), net)?;
     } else {
-        distribute(env, &c.token, &payees, amount)
+        distribute(env, &c.token, &payees, net)?;
     }
+    Ok(())
+}
+
+fn escrow_fee(env: &Env, id: u64) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::EscrowFee(id))
+        .unwrap_or(0)
 }
 
 /// Shared builder for `create_contract`, `create_contract_sequential` and
@@ -846,6 +898,15 @@ fn build_escrow(
     env.storage()
         .persistent()
         .extend_ttl(&fund_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    // Snapshot the protocol fee so later fee changes never apply to this escrow.
+    let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+    if fee_bps > 0 {
+        let fee_key = DataKey::EscrowFee(id);
+        env.storage().persistent().set(&fee_key, &fee_bps);
+        env.storage()
+            .persistent()
+            .extend_ttl(&fee_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    }
     if review_window_secs != DEFAULT_REVIEW_WINDOW_SECS {
         let rw_key = DataKey::ReviewWindow(id);
         env.storage().persistent().set(&rw_key, &review_window_secs);
@@ -1439,6 +1500,38 @@ impl Escrow {
         Ok(())
     }
 
+    /// Admin sets the protocol fee (`fee_bps <= MAX_FEE_BPS`, else `FeeTooHigh`)
+    /// and its treasury. New escrows snapshot the rate at creation; existing
+    /// escrows keep theirs. Emits `("fee_set",) -> (fee_bps, treasury)`.
+    pub fn set_fee(env: Env, fee_bps: u32, treasury: Address) -> Result<(), EscrowError> {
+        require_admin(&env)?;
+        if fee_bps > MAX_FEE_BPS {
+            return Err(EscrowError::FeeTooHigh);
+        }
+        if treasury == env.current_contract_address() {
+            return Err(EscrowError::InvalidParties);
+        }
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("fee_set"),), (fee_bps, treasury));
+        Ok(())
+    }
+
+    /// Current `(fee_bps, treasury)`; `(0, None)` by default.
+    pub fn get_fee_config(env: Env) -> (u32, Option<Address>) {
+        (
+            env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
+            env.storage().instance().get(&DataKey::Treasury),
+        )
+    }
+
+    /// Fee rate (bps) snapshotted for escrow `id` at creation (0 if none).
+    pub fn get_escrow_fee(env: Env, id: u64) -> u32 {
+        escrow_fee(&env, id)
+    }
+
     /// Current pause bitmask (`0` when nothing is paused).
     pub fn get_pause_flags(env: Env) -> u32 {
         pause_flags(&env)
@@ -1880,7 +1973,7 @@ impl Escrow {
         if c.funded_amount - c.released_amount < remaining {
             return Err(EscrowError::InsufficientFunds);
         }
-        pay_out(&env, &c, remaining)?;
+        let fee = pay_out(&env, &c, remaining)?;
         m.released = true;
         c.released_amount = c
             .released_amount
@@ -1904,7 +1997,7 @@ impl Escrow {
         save(&env, &c);
         env.events()
             .publish((symbol_short!("claim"), id), (index, remaining));
-        events::release(&env, &c, index, remaining, &payee(&env, &c), c.released_amount);
+        events::release(&env, &c, index, remaining, &payee(&env, &c), c.released_amount, fee);
         if completed {
             events::completed(&env, &c);
         }
@@ -1964,7 +2057,7 @@ impl Escrow {
         if c.funded_amount - c.released_amount < remaining {
             return Err(EscrowError::InsufficientFunds);
         }
-        pay_out(&env, &c, remaining)?;
+        let fee = pay_out(&env, &c, remaining)?;
         m.released = true;
         c.released_amount = c
             .released_amount
@@ -1985,7 +2078,7 @@ impl Escrow {
         #[cfg(any(test, debug_assertions))]
         assert_solvent(&env, &c.token);
         save(&env, &c);
-        events::release(&env, &c, index, remaining, &payee(&env, &c), c.released_amount);
+        events::release(&env, &c, index, remaining, &payee(&env, &c), c.released_amount, fee);
         if completed {
             events::completed(&env, &c);
         }
@@ -2130,7 +2223,16 @@ impl Escrow {
             return Err(EscrowError::InsufficientFunds);
         }
 
-        pay_out(&env, &c, total)?;
+        let mut fees: Vec<i128> = Vec::new(&env);
+        let mut fee_total: i128 = 0;
+        for amount in paid_now.iter() {
+            let fee = fee_for(&env, &c, amount);
+            fees.push_back(fee);
+            fee_total = fee_total
+                .checked_add(fee)
+                .ok_or(EscrowError::ArithmeticOverflow)?;
+        }
+        pay_out_with_fee(&env, &c, total, fee_total)?;
         for (pos, index) in indices.iter().enumerate() {
             let mut m = c.milestones.get(index).unwrap();
             m.released = true;
@@ -2164,7 +2266,7 @@ impl Escrow {
             running = running
                 .checked_add(amount)
                 .ok_or(EscrowError::ArithmeticOverflow)?;
-            events::release(&env, &c, index, amount, &to, running);
+            events::release(&env, &c, index, amount, &to, running, fees.get(pos as u32).unwrap());
         }
         env.events()
             .publish((symbol_short!("rel_batch"), id), (count, total));
@@ -3480,6 +3582,7 @@ mod events {
         amount: i128,
         to: &Address,
         released_amount: i128,
+        fee: i128,
     ) {
         env.events().publish(
             escrow_topic(symbol_short!("release"), c.id),
@@ -3489,6 +3592,7 @@ mod events {
                 to: to.clone(),
                 released_amount,
                 status: c.status,
+                fee,
             },
         );
     }

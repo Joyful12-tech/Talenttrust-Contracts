@@ -71,6 +71,8 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `emergency_withdraw(id, caller)` | client or freelancer | After a continuous pause of `EMERGENCY_EXIT_DELAY_SECS` (30 days) unwind a `Created`/`Funded`/`Disputed` escrow: unreleased funds return to the client/funders (submitted milestones go to the freelancer); `Disputed` splits 50/50 with the remainder to the client and returns the dispute bond; ends `Cancelled`. `EmergencyExitNotAvailable` (`47`) before the delay or while unpaused. Emits `("emerg", id) -> (to_client, to_freelancer)`. Re-pausing restarts the clock (the admin can delay, but not block, an exit only by keeping the contract unpaused) |
 | `get_paused_at()` | - | Timestamp at which the current pause began |
 | `set_paused(caller, paused)` / `is_paused()` | admin or Pauser / - | Circuit breaker for all mutations |
+| `set_fee(fee_bps, treasury)` | admin | Protocol fee on freelancer-side payouts (releases, claims, the freelancer share of disputes/settlements), capped at `MAX_FEE_BPS = 500` (`FeeTooHigh` (`49`) above); each escrow snapshots the rate at creation, so later changes never apply to it. Refunds are fee-free. Emits `("fee_set",) -> (fee_bps, treasury)`; `ReleaseEvent.fee` reports the fee per release |
+| `get_fee_config()`, `get_escrow_fee(id)` | - | `(fee_bps, Option<treasury>)` and an escrow's snapshotted rate |
 | `set_pause_flags(caller, flags)` / `get_pause_flags()` | admin or Pauser / - | Granular pause bitmask: `PAUSE_CREATE = 1` (create/configure), `PAUSE_DEPOSIT = 2`, `PAUSE_RELEASE = 4` (releases, claims, bonuses, deliveries), `PAUSE_DISPUTE = 8`, `PAUSE_CANCEL = 16` (cancel, resign, settlement, expiry), `PAUSE_REPUTATION = 32` (ratings), `PAUSE_ALL = 63`; other bits return `InvalidAmount`. `set_paused(true)` sets `PAUSE_ALL`, `false` clears; `is_paused()` is true iff any flag is set. Emits `("pause",) -> flags` |
 | `grant_role(role, account)` / `revoke_role(role, account)` | admin | Grant or revoke a `Pauser` or `Resolver` role (`RoleUnchanged` (`33`) if no change); emits `("role_set", role) -> (account, true\|false)` |
 | `has_role(role, account)` | - | Role membership; the admin implicitly holds every role |
@@ -132,7 +134,7 @@ Core lifecycle events are versioned and structured: escrow events use topics
 | paused | `(1, "paused")` | `bool` | `set_paused` |
 | created | `(1, "created", id)` | `CreatedEvent { client, freelancer, token, total, milestone_count }` | `create_contract`, `create_contract_sequential`, `create_and_fund` |
 | deposit | `(1, "deposit", id)` | `DepositEvent { from, amount, funded_amount, status }` | `deposit_funds`, `deposit_from`, `create_and_fund` |
-| release | `(1, "release", id)` | `ReleaseEvent { index, amount, to, released_amount, status }` | `release_milestone`, `release_milestones` (one per milestone) |
+| release | `(1, "release", id)` | `ReleaseEvent { index, amount, to, released_amount, status, fee }` | `release_milestone`, `release_milestones` (one per milestone) |
 | complete | `(1, "complete", id)` | `CompletedEvent { released_amount }` | exactly once, when the last milestone is released (single, batch or partial release) |
 | dispute | `(1, "dispute", id)` | `DisputeEvent { by, status, bond }` | `open_dispute` |
 | resolved | `(1, "resolved", id)` | `ResolvedEvent { to_freelancer, to_client, status, bond_recipient, bond }` | `resolve_dispute`, panel settlement |
@@ -208,6 +210,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 46 | `NoPendingAdmin` | `accept_admin` / `cancel_admin_proposal` without a nomination |
 | 47 | `EmergencyExitNotAvailable` | `emergency_withdraw` while unpaused or before the pause delay elapsed |
 | 48 | `SettlementMismatch` | `accept_settlement` self-accept, without a proposal, or with a different amount |
+| 49 | `FeeTooHigh` | `set_fee` above `MAX_FEE_BPS` |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 

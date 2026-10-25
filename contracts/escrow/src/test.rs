@@ -4835,6 +4835,7 @@ fn release_events_and_complete_emitted_exactly_once() {
             to: s.freelancer.clone(),
             released_amount: 100 * U,
             status: ContractStatus::Funded,
+            fee: 0,
         }
     );
     assert_eq!(count_escrow_events(&s, "complete"), 0);
@@ -6790,4 +6791,151 @@ fn legacy_paused_flag_means_pause_all() {
         ),
         Err(Ok(EscrowError::Paused))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Snapshotted platform fee
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fee_snapshot_survives_admin_fee_increase() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.escrow.set_fee(&100, &treasury);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    assert_eq!(s.escrow.get_escrow_fee(&id), 100);
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.set_fee(&300, &treasury);
+    assert_eq!(s.escrow.get_fee_config(), (300, Some(treasury.clone())));
+    s.escrow.release_milestone(&id, &0);
+    let rel: ReleaseEvent = last_escrow_event(&s, "release", id).unwrap();
+    assert_eq!(rel.fee, U);
+    // 1% of 100 units, not 3%.
+    assert_eq!(s.token.balance(&treasury), U);
+    assert_eq!(s.token.balance(&s.freelancer), 99 * U);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    // Conservation: freelancer + treasury + client deltas = escrow total.
+    let client_delta = 1_000 * U - s.token.balance(&s.client);
+    assert_eq!(
+        s.token.balance(&s.freelancer) + s.token.balance(&treasury),
+        client_delta
+    );
+    // New escrows use the new rate.
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    assert_eq!(s.escrow.get_escrow_fee(&id2), 300);
+}
+
+#[test]
+fn fee_rounds_down_on_tiny_amounts() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.escrow.set_fee(&100, &treasury);
+    // A milestone of 1_000_099 base units: 1% = 10_000.99 -> 10_000 (rounded down).
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 1_000_099i128],
+    );
+    s.escrow.deposit_funds(&id, &1_000_099);
+    s.escrow.release_partial(&id, &0, &99);
+    // 99 * 1% < 1 unit: no fee, freelancer receives everything.
+    assert_eq!(s.token.balance(&treasury), 0);
+    assert_eq!(s.token.balance(&s.freelancer), 99);
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(s.token.balance(&treasury), 10_000);
+    assert_eq!(s.token.balance(&s.freelancer), 1_000_099 - 10_000);
+}
+
+#[test]
+fn dispute_fee_only_on_freelancer_share_and_cancel_free() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.escrow.set_fee(&500, &treasury);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 400 * U],
+    );
+    s.escrow.deposit_funds(&id, &(400 * U));
+    open_dispute_bonded(&s, &id, &s.freelancer);
+    resolve_refunding_bond(&s, &id, &2_500);
+    // Freelancer share 100 units minus 5% fee; the client's 300 refund is fee-free.
+    assert_eq!(s.token.balance(&treasury), 5 * U);
+    assert_eq!(s.token.balance(&s.freelancer), 95 * U);
+    assert_eq!(s.token.balance(&s.client), 900 * U);
+
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50 * U],
+    );
+    s.escrow.deposit_funds(&id2, &(50 * U));
+    s.escrow.cancel_contract(&id2);
+    assert_eq!(s.token.balance(&s.client), 900 * U);
+    assert_eq!(s.token.balance(&treasury), 5 * U);
+}
+
+#[test]
+fn set_fee_cap_and_admin_only() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    assert_eq!(s.escrow.get_fee_config(), (0, None));
+    assert_eq!(
+        s.escrow.try_set_fee(&(MAX_FEE_BPS + 1), &treasury),
+        Err(Ok(EscrowError::FeeTooHigh))
+    );
+    s.env.mock_auths(&[]);
+    assert!(s.escrow.try_set_fee(&100, &treasury).is_err());
+    s.env.mock_all_auths();
+    assert_eq!(s.escrow.get_fee_config(), (0, None));
+    s.escrow.set_fee(&MAX_FEE_BPS, &treasury);
+    let ev = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.escrow.address)
+        .last()
+        .unwrap();
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &ev.1.get(0).unwrap()).unwrap(),
+        symbol_short!("fee_set")
+    );
+    assert_eq!(
+        <(u32, Address)>::try_from_val(&s.env, &ev.2).unwrap(),
+        (MAX_FEE_BPS, treasury)
+    );
+}
+
+#[test]
+fn batch_release_charges_exact_per_milestone_fees() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.escrow.set_fee(&250, &treasury);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(300 * U));
+    s.escrow
+        .release_milestones(&id, &vec![&s.env, 0u32, 1u32]);
+    let fee = mul_bps(100 * U, 250) + mul_bps(200 * U, 250);
+    assert_eq!(s.token.balance(&treasury), fee);
+    assert_eq!(s.token.balance(&s.freelancer), 300 * U - fee);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
 }
