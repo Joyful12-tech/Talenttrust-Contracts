@@ -3589,3 +3589,116 @@ fn non_admin_cannot_allow_or_disallow_token() {
         .allow_token(&other.address);
     assert!(s.escrow.is_token_allowed(&other.address));
 }
+
+// Additional tests for token allowlist covering acceptance criteria explicitly.
+
+#[test]
+fn creating_with_non_allowlisted_sac_fails_then_succeeds_after_allow() {
+    let s = setup();
+    let other_admin = Address::generate(&s.env);
+    let other_sac = s.env.register_stellar_asset_contract_v2(other_admin.clone());
+    let other_token = TokenClient::new(&s.env, &other_sac.address());
+    StellarAssetClient::new(&s.env, &other_sac.address()).mint(&s.client, &(1_000 * U));
+
+    // Creating with a non-allowlisted SAC fails with TokenNotAllowed.
+    assert_eq!(
+        s.escrow.try_create_contract(
+            &s.client,
+            &s.freelancer,
+            &other_token.address,
+            &vec![&s.env, 100 * U],
+        ),
+        Err(Ok(EscrowError::TokenNotAllowed))
+    );
+
+    // After allow_token it succeeds.
+    s.escrow.allow_token(&other_token.address);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &other_token.address,
+        &vec![&s.env, 100 * U],
+    );
+    assert_eq!(id, 1);
+}
+
+#[test]
+fn escrow_created_before_disallow_can_still_be_released_and_cancelled() {
+    let s = setup();
+
+    // Create and fund an escrow, then disallow the token.
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+
+    // Disallow the token.
+    s.escrow.disallow_token(&s.token.address);
+    assert!(!s.escrow.is_token_allowed(&s.token.address));
+
+    // The escrow can still be released.
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+
+    // Create another escrow (after re-allowing), fund it, then disallow again,
+    // and verify it can still be cancelled.
+    s.escrow.allow_token(&s.token.address);
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50 * U],
+    );
+    s.escrow.deposit_funds(&id2, &(50 * U));
+    s.escrow.disallow_token(&s.token.address);
+    s.escrow.cancel_contract(&id2);
+    assert_eq!(s.escrow.get_contract(&id2).status, ContractStatus::Cancelled);
+    // Client should have recovered funds: started with 1000*U, spent 100+50,
+    // got back 50 from cancellation = 900*U.
+    assert_eq!(s.token.balance(&s.client), 900 * U);
+}
+
+#[test]
+fn non_admin_allow_disallow_rejected_with_explicit_mock_auths() {
+    let s = setup();
+    let new_token = Address::generate(&s.env);
+
+    // Non-admin cannot allow a token - with explicit mock_auths.
+    let non_admin = Address::generate(&s.env);
+    let allow_result = s
+        .escrow
+        .mock_auths(&[MockAuth {
+            address: &non_admin,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "allow_token",
+                args: (new_token.clone(),).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_allow_token(&new_token);
+    assert!(allow_result.is_err());
+    assert!(!s.escrow.is_token_allowed(&new_token));
+
+    // Non-admin cannot disallow a token - with explicit mock_auths.
+    s.escrow.allow_token(&new_token);
+    let deny_result = s
+        .escrow
+        .mock_auths(&[MockAuth {
+            address: &non_admin,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "disallow_token",
+                args: (new_token.clone(),).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_disallow_token(&new_token);
+    assert!(deny_result.is_err());
+    assert!(s.escrow.is_token_allowed(&new_token));
+}
