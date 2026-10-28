@@ -513,7 +513,7 @@ fn build_escrow(
     require_not_paused(&env)?;
     client.require_auth();
 
-    // Validation order: parties -> milestones -> amounts.
+    // Validation order: parties -> milestones -> token allowlist -> amounts.
     // ---- Parties ----
     let contract_addr = env.current_contract_address();
     if client == contract_addr
