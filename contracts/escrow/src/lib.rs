@@ -10,6 +10,10 @@
 //! 7. After completion the client may `issue_reputation` for the freelancer.
 //! 8. The client may `pay_bonus` directly to the freelancer (tip/bonus).
 //! 9. After completion or resolution the freelancer may `rate_client` to rate the client.
+//!
+//! The escrow currency must be on the admin-managed allowlist (`allow_token` /
+//! `disallow_token`) at creation time; `disallow_token` never affects escrows
+//! that already exist in that token.
 #![no_std]
 
 use soroban_sdk::{
@@ -83,6 +87,7 @@ pub enum EscrowError {
     InvalidPanel = 31,
     PanelRequired = 32,
     RoleUnchanged = 33,
+    TokenNotAllowed = 34,
 }
 
 #[contracttype]
@@ -230,6 +235,7 @@ enum DataKey {
     Panel,
     Votes(u64),
     RoleMember(Role, Address),
+    AllowedToken(Address),
 }
 
 #[contract]
@@ -277,6 +283,22 @@ fn set_role(env: &Env, role: Role, account: Address, member: bool) -> Result<(),
         .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
     env.events()
         .publish((symbol_short!("role_set"), role), (account, member));
+    Ok(())
+}
+
+/// Admin allowlist gate: only escrows denominated in an approved token may be
+/// created. Checked once, at creation time, so later lifecycle calls never
+/// consult it and funds in an escrow whose token is later disallowed remain
+/// fully movable (deposit, release, refund, dispute).
+fn require_token_allowed(env: &Env, token: &Address) -> Result<(), EscrowError> {
+    let allowed = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&DataKey::AllowedToken(token.clone()))
+        .unwrap_or(false);
+    if !allowed {
+        return Err(EscrowError::TokenNotAllowed);
+    }
     Ok(())
 }
 
@@ -510,6 +532,9 @@ fn build_escrow(
     if n == 0 || n > MAX_MILESTONES {
         return Err(EscrowError::InvalidMilestones);
     }
+
+    // ---- Token allowlist (admin-approved currencies only) ----
+    require_token_allowed(&env, &token)?;
 
     // ---- Amounts ----
     let mut milestones = Vec::new(&env);
@@ -868,6 +893,8 @@ impl Escrow {
     }
 
     /// Creates a new escrow agreement. Returns the escrow id.
+    ///
+    /// `token` must be on the admin allowlist, otherwise `TokenNotAllowed`.
     pub fn create_contract(
         env: Env,
         client: Address,
@@ -895,6 +922,42 @@ impl Escrow {
             .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
         env.events().publish((symbol_short!("seq"), id), true);
         Ok(id)
+    }
+
+    /// Admin-only: allowlists a token as an escrow currency. Idempotent;
+    /// emits `("tok_allow",) -> token`.
+    pub fn allow_token(env: Env, token: Address) -> Result<(), EscrowError> {
+        require_admin(&env)?;
+        let key = DataKey::AllowedToken(token.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events().publish((symbol_short!("tok_allow"),), token);
+        Ok(())
+    }
+
+    /// Admin-only: removes a token from the escrow currency allowlist.
+    /// Only affects *new* escrows: existing escrows in this token keep
+    /// depositing, releasing, refunding and disputing normally, so funds are
+    /// never trapped. Idempotent; emits `("tok_deny",) -> token`.
+    pub fn disallow_token(env: Env, token: Address) -> Result<(), EscrowError> {
+        require_admin(&env)?;
+        let key = DataKey::AllowedToken(token.clone());
+        env.storage().persistent().set(&key, &false);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events().publish((symbol_short!("tok_deny"),), token);
+        Ok(())
+    }
+
+    /// Whether `token` may currently be used to create an escrow.
+    pub fn is_token_allowed(env: Env, token: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::AllowedToken(token))
+            .unwrap_or(false)
     }
 
     /// Lowest unreleased milestone index, or `None` once every milestone is

@@ -27,8 +27,10 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | Function | Auth | Description |
 | --- | --- | --- |
 | `initialize(admin)` | admin | One-time setup |
-| `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones. Rejects self-referential parties (client, freelancer or token equal to the contract address), the admin as client or freelancer, milestones below `MIN_MILESTONE_AMOUNT` (1 000 000), and totals above `MAX_ESCROW_TOTAL` (10¹⁸). Validation order: parties → milestones → amounts. |
-| `create_contract_sequential(client, freelancer, token, milestone_amounts) -> u64` | client | Same as `create_contract`, but milestones must be released strictly in order (`OutOfOrder` (`28`) otherwise); emits `("seq", id) -> true` |
+| `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones. Rejects self-referential parties (client, freelancer or token equal to the contract address), the admin as client or freelancer, tokens that are not on the admin allowlist (`TokenNotAllowed` (`34`)), milestones below `MIN_MILESTONE_AMOUNT` (1 000 000), and totals above `MAX_ESCROW_TOTAL` (10¹⁸). Validation order: parties → milestones → token allowlist → amounts. |
+| `create_contract_sequential(client, freelancer, token, milestone_amounts) -> u64` | client | Same as `create_contract` (including the token allowlist check), but milestones must be released strictly in order (`OutOfOrder` (`28`) otherwise); emits `("seq", id) -> true` |
+| `allow_token(token)` / `disallow_token(token)` | admin | Manage the escrow currency allowlist: only allowlisted tokens may be used to create escrows. `disallow_token` affects **new** escrows only — existing escrows in that token keep depositing, releasing, refunding and disputing, so funds are never trapped. Idempotent; emits `("tok_allow",) -> token` / `("tok_deny",) -> token` |
+| `is_token_allowed(token) -> bool` | - | Whether `token` may currently be used to create an escrow |
 | `deposit_funds(id, amount)` | client | Transfer tokens into escrow (status must be `Created`, cannot exceed total) |
 | `set_team_split(id, payees)` | freelancer | Configure 1-5 fixed-bps payee shares (sum 10,000) while `Created` and before any deposit (`InvalidSplitConfig` (`27`) otherwise); emits `("team", id) -> len` |
 | `release_milestone(id, index)` | client | Pay the milestone to the team split if set, otherwise the freelancer (or their payout address) |
@@ -85,6 +87,8 @@ Bonuses are allowed while an escrow is `Funded` or `Completed`; they do not chan
 | Event | Topic | Data |
 | --- | --- | --- |
 | Bonus paid | `("bonus", id)` | `(amount, cumulative)` |
+| Token allowlisted | `("tok_allow",)` | `token` |
+| Token removed from the allowlist | `("tok_deny",)` | `token` |
 
 Bonus payments reuse the escrow's existing validation errors: a missing escrow `id`, an escrow in a disallowed state (`Disputed`, `Cancelled`, `Resolved`), a non-positive `amount`, an unauthorized caller (client auth required), and the pause gate all return the corresponding contract error.
 
@@ -131,6 +135,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 31 | `InvalidPanel` | `set_panel` — bad threshold/size or duplicate members |
 | 32 | `PanelRequired` | `resolve_dispute` on an escrow with `total_amount >= PANEL_THRESHOLD_AMOUNT` (10^12) — settle via `vote_resolution` |
 | 33 | `RoleUnchanged` | `grant_role` on an existing member / `revoke_role` on a non-member |
+| 34 | `TokenNotAllowed` | `create_contract` / `create_contract_sequential` — `token` is not on the admin allowlist |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 
